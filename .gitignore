@@ -1,0 +1,15 @@
+.env
+attendance.db
+attendance.db.bak*
+*.xlsx
+bot.pid
+bot_stdout.log
+bot_watchdog.log
+__pycache__/
+*.pyc
+tmp/
+.well-known/
+.user.ini
+.htaccess
+public/
+venv/

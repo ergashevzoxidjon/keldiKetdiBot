@@ -1,0 +1,5 @@
+aiogram>=3.0,<4.0
+APScheduler>=3.10,<4.0
+openpyxl>=3.1,<4.0
+python-dotenv>=1.0,<2.0
+Flask>=3.0,<4.0
