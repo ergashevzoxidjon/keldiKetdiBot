@@ -140,7 +140,9 @@ def init_db():
                 monthly_salary REAL DEFAULT 0.0,
                 norm_days INTEGER DEFAULT 26,
                 work_start_time TEXT DEFAULT NULL,
-                work_end_time TEXT DEFAULT NULL
+                work_end_time TEXT DEFAULT NULL,
+                auto_checkout_enabled INTEGER DEFAULT 0,
+                overtime_eligible INTEGER DEFAULT 0
             )
         ''')
 
@@ -158,6 +160,7 @@ def init_db():
                 break_end TEXT DEFAULT NULL,
                 break_minutes INTEGER DEFAULT 0,
                 work_hours REAL DEFAULT 0,
+                paid_hours REAL DEFAULT 0,
                 checkin_source TEXT DEFAULT 'self',
                 checkout_source TEXT DEFAULT 'self',
                 FOREIGN KEY(user_id) REFERENCES users(user_id)
@@ -195,10 +198,13 @@ def init_db():
             ("users", "norm_days INTEGER DEFAULT 26"),
             ("users", "work_start_time TEXT DEFAULT NULL"),
             ("users", "work_end_time TEXT DEFAULT NULL"),
+            ("users", "auto_checkout_enabled INTEGER DEFAULT 0"),
+            ("users", "overtime_eligible INTEGER DEFAULT 0"),
             ("attendance", "lateness_reason TEXT DEFAULT ''"),
             ("attendance", "break_start TEXT DEFAULT NULL"),
             ("attendance", "break_end TEXT DEFAULT NULL"),
             ("attendance", "break_minutes INTEGER DEFAULT 0"),
+            ("attendance", "paid_hours REAL DEFAULT 0"),
             ("attendance", "checkin_source TEXT DEFAULT 'self'"),
             ("attendance", "checkout_source TEXT DEFAULT 'self'")
         ]
@@ -208,6 +214,15 @@ def init_db():
                 cursor.execute(f"ALTER TABLE {table} ADD COLUMN {col}")
             except sqlite3.OperationalError:
                 pass
+
+        # paid_hours (2x hisoblash uchun "to'lanadigan soat") yangi ustun -
+        # eski yozuvlarda hali to'ldirilmagan (0) bo'lgan joylarda, hozircha
+        # oddiy ishlangan soatga tenglashtiramiz (moziyga qarab 2x qayta
+        # hisoblanmaydi - bu funksiya shu paytdan boshlab ishlaydi).
+        cursor.execute(
+            "UPDATE attendance SET paid_hours = work_hours "
+            "WHERE (paid_hours IS NULL OR paid_hours = 0) AND work_hours IS NOT NULL AND work_hours > 0"
+        )
 
         # Bir kunda bitta xodim uchun faqat bitta davomat yozuvi bo'lishini
         # ta'minlaydigan UNIQUE indeks (race condition'ni oldini oladi).
@@ -312,6 +327,137 @@ def _set_work_days_sync(user_id: int, month_prefix: str, days: list[int]):
                 "INSERT OR IGNORE INTO work_schedule (user_id, date) VALUES (?, ?)",
                 (user_id, date_str)
             )
+        conn.commit()
+
+
+def _is_work_day(cursor, user_id: int, date_str: str) -> bool:
+    """Shu xodim uchun shu SANA ish kunimi (ya'ni reminder/kelmagan mantig'ida
+    hisobga olinishi kerakmi)?
+
+    Agar admin shu OY uchun kalendarda (work_schedule) hech qanday kun
+    belgilamagan bo'lsa - eski standart qoida ishlaydi: yakshanbadan tashqari
+    barcha kunlar ish kuni (orqaga moslik, hech narsa buzilmaydi).
+
+    Agar admin shu oy uchun kamida bitta kun belgilagan bo'lsa - ENDI faqat
+    aynan o'sha belgilangan sanalargina ish kuni hisoblanadi, qolganlari esa
+    (yakshanba bo'lsin yoki bo'lmasin) dam olish kuni hisoblanadi va xodimga
+    xabarnoma yuborilmaydi, "kelmagan" deb ham belgilanmaydi."""
+    month_prefix = date_str[:7]
+    cursor.execute(
+        "SELECT COUNT(*) FROM work_schedule WHERE user_id = ? AND date LIKE ?",
+        (user_id, f"{month_prefix}%")
+    )
+    has_calendar = cursor.fetchone()[0] > 0
+    if has_calendar:
+        cursor.execute(
+            "SELECT 1 FROM work_schedule WHERE user_id = ? AND date = ?",
+            (user_id, date_str)
+        )
+        return cursor.fetchone() is not None
+    weekday = datetime.strptime(date_str, "%Y-%m-%d").weekday()  # Dushanba=0 ... Yakshanba=6
+    return weekday != 6
+
+
+def _is_work_day_sync(user_id: int, date_str: str) -> bool:
+    with get_db() as conn:
+        return _is_work_day(conn.cursor(), user_id, date_str)
+
+
+def _compute_lateness_minutes(date_str: str, actual_time_str: str, work_start: str) -> int:
+    """Kechikish daqiqasini hisoblaydi. Xodim o'zi kelganda ham, admin qo'lda
+    kiritganda ham FAQAT shu YAGONA funksiya orqali hisoblanadi - shunday
+    qilib ikkala oqim doim bir xil natija beradi va admin belgilagan ish
+    boshlash vaqtidan chindan kech bo'lgandagina musbat qiymat qaytaradi."""
+    actual_fmt = "%H:%M:%S" if actual_time_str.count(":") == 2 else "%H:%M"
+    actual_dt = datetime.strptime(f"{date_str} {actual_time_str}", f"%Y-%m-%d {actual_fmt}")
+    work_start_dt = datetime.strptime(f"{date_str} {work_start}", "%Y-%m-%d %H:%M")
+    diff_minutes = int((actual_dt - work_start_dt).total_seconds() / 60)
+    return max(0, diff_minutes)
+
+
+def _compute_paid_hours(date_str: str, check_in_time: str, check_out_time: str,
+                         break_minutes: float, overtime_eligible: bool) -> float:
+    """To'lanadigan (haq hisoblanadigan) soatni qaytaradi.
+
+    - Oddiy xodim uchun: ishlangan net-soatga teng (work_hours bilan bir xil).
+    - 2x-huquqli ("overtime_eligible") xodim uchun: mehnat qonunchiligiga
+      ko'ra, 21:00'dan keyingi soatlar VA yakshanba kunidagi barcha soatlar
+      2 barobar hisoblanadi (ikkalasi bir vaqtda bo'lsa ham ko'paytmalanmaydi,
+      ko'pi bilan 2x)."""
+    in_fmt = "%H:%M:%S" if check_in_time.count(":") == 2 else "%H:%M"
+    out_fmt = "%H:%M:%S" if check_out_time.count(":") == 2 else "%H:%M"
+    check_in_dt = datetime.strptime(f"{date_str} {check_in_time}", f"%Y-%m-%d {in_fmt}")
+    check_out_dt = datetime.strptime(f"{date_str} {check_out_time}", f"%Y-%m-%d {out_fmt}")
+    if check_out_dt < check_in_dt:
+        # Tungi smena ehtimoli uchun ehtiyot chorasi (kechasi 00:00'dan o'tib ketish)
+        check_out_dt += timedelta(days=1)
+
+    break_seconds = max(0.0, break_minutes or 0.0) * 60
+
+    if not overtime_eligible:
+        total_seconds = max(0.0, (check_out_dt - check_in_dt).total_seconds() - break_seconds)
+        return round(total_seconds / 3600, 2)
+
+    is_sunday = check_in_dt.weekday() == 6
+    if is_sunday:
+        total_seconds = max(0.0, (check_out_dt - check_in_dt).total_seconds() - break_seconds)
+        return round((total_seconds / 3600) * 2, 2)
+
+    cutoff = check_in_dt.replace(hour=21, minute=0, second=0, microsecond=0)
+    if check_out_dt <= cutoff:
+        total_seconds = max(0.0, (check_out_dt - check_in_dt).total_seconds() - break_seconds)
+        return round(total_seconds / 3600, 2)
+    if check_in_dt >= cutoff:
+        total_seconds = max(0.0, (check_out_dt - check_in_dt).total_seconds() - break_seconds)
+        return round((total_seconds / 3600) * 2, 2)
+
+    normal_seconds = max(0.0, (cutoff - check_in_dt).total_seconds() - break_seconds)
+    remaining_break_seconds = max(0.0, break_seconds - (cutoff - check_in_dt).total_seconds())
+    overtime_seconds = max(0.0, (check_out_dt - cutoff).total_seconds() - remaining_break_seconds)
+    paid_hours = (normal_seconds / 3600) + (overtime_seconds / 3600) * 2
+    return round(paid_hours, 2)
+
+
+def _get_user_flags_sync(user_id: int):
+    """Xodimning ish vaqti + maxsus qoidalar (avto-ketish, 2x haq) bayroqlarini qaytaradi."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT work_start_time, work_end_time, auto_checkout_enabled, overtime_eligible "
+            "FROM users WHERE user_id = ?",
+            (user_id,)
+        )
+        row = cursor.fetchone()
+        if not row:
+            return {
+                "work_start": WORK_START_TIME, "work_end": WORK_END_TIME,
+                "auto_checkout_enabled": False, "overtime_eligible": False,
+            }
+        return {
+            "work_start": row[0] or WORK_START_TIME,
+            "work_end": row[1] or WORK_END_TIME,
+            "auto_checkout_enabled": bool(row[2]),
+            "overtime_eligible": bool(row[3]),
+        }
+
+
+def _set_auto_checkout_sync(user_id: int, enabled: bool):
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE users SET auto_checkout_enabled = ? WHERE user_id = ?",
+            (1 if enabled else 0, user_id)
+        )
+        conn.commit()
+
+
+def _set_overtime_eligible_sync(user_id: int, enabled: bool):
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE users SET overtime_eligible = ? WHERE user_id = ?",
+            (1 if enabled else 0, user_id)
+        )
         conn.commit()
 
 
@@ -424,7 +570,8 @@ def _generate_excel_report_sync(month_prefix: str, file_path: str):
 
         headers = [
             "Xodim F.I.Sh", "Belgilangan Oylik", "Norma kun",
-            "Jami Ishlangan Soat", "Hisoblangan Maosh", "Berilgan Avans", "Sof Beriladigan Oylik"
+            "Jami Ishlangan Soat", "To'lanadigan Soat (2x bilan)",
+            "Hisoblangan Maosh", "Berilgan Avans", "Sof Beriladigan Oylik"
         ]
         for day in range(1, days_in_month + 1):
             headers.append(f"{day}-kun Kelgan")
@@ -442,10 +589,13 @@ def _generate_excel_report_sync(month_prefix: str, file_path: str):
 
         for u_id, full_name, m_salary, fallback_norm_d in users:
             cursor.execute(
-                "SELECT COALESCE(SUM(work_hours), 0.0) FROM attendance WHERE user_id = ? AND date LIKE ?",
+                "SELECT COALESCE(SUM(work_hours), 0.0), COALESCE(SUM(paid_hours), 0.0) "
+                "FROM attendance WHERE user_id = ? AND date LIKE ?",
                 (u_id, f"{month_prefix}%")
             )
-            w_hours = cursor.fetchone()[0] or 0.0
+            w_hours, p_hours = cursor.fetchone()
+            w_hours = w_hours or 0.0
+            p_hours = p_hours or 0.0
 
             cursor.execute(
                 "SELECT COALESCE(SUM(amount), 0.0) FROM advances WHERE user_id = ? AND date LIKE ?",
@@ -455,12 +605,14 @@ def _generate_excel_report_sync(month_prefix: str, file_path: str):
 
             norm_d = _norm_days_for_month(cursor, u_id, month_prefix, fallback_norm_d)
             hourly_rate = m_salary / (norm_d * 8) if norm_d and norm_d > 0 else 0
-            earned = w_hours * hourly_rate
+            # Ish haqi FAQAT to'lanadigan soatga (p_hours - 2x hisobga olingan
+            # kech/yakshanba soatlari bilan) nisbatan hisoblanadi.
+            earned = p_hours * hourly_rate
             net_salary = earned - adv_sum
 
             row = [
                 full_name, m_salary, norm_d,
-                round(w_hours, 1), round(earned, 2), adv_sum, round(net_salary, 2)
+                round(w_hours, 1), round(p_hours, 1), round(earned, 2), adv_sum, round(net_salary, 2)
             ]
 
             # Shu oy uchun xodimning har bir kunlik kelish/ketish vaqtlarini
@@ -498,7 +650,7 @@ def _generate_daily_excel_report_sync(date_str: str, file_path: str):
         cursor = conn.cursor()
         cursor.execute('''
             SELECT u.user_id, u.full_name, a.check_in_time, a.check_out_time, a.lateness_minutes,
-                   a.lateness_reason, a.break_minutes, a.work_hours, u.monthly_salary, u.norm_days
+                   a.lateness_reason, a.break_minutes, a.work_hours, a.paid_hours, u.monthly_salary, u.norm_days
             FROM attendance a
             JOIN users u ON u.user_id = a.user_id
             WHERE a.date = ?
@@ -506,21 +658,23 @@ def _generate_daily_excel_report_sync(date_str: str, file_path: str):
         ''', (date_str,))
         rows = cursor.fetchall()
 
-        # Bugun umuman check-in qilmagan tasdiqlangan xodimlarni ham aniqlaymiz
+        # Bugun umuman check-in qilmagan tasdiqlangan xodimlarni ham aniqlaymiz -
+        # lekin FAQAT o'sha xodim uchun shu sana ish kuni bo'lsa (aks holda dam
+        # olish kunida bo'lgani uchun "KELMADI" deb noto'g'ri belgilanmasin).
         cursor.execute('''
-            SELECT u.full_name FROM users u
+            SELECT u.user_id, u.full_name FROM users u
             WHERE u.is_approved = 1
               AND u.user_id NOT IN (SELECT user_id FROM attendance WHERE date = ?)
             ORDER BY u.full_name COLLATE NOCASE
         ''', (date_str,))
-        absent = [r[0] for r in cursor.fetchall()]
+        absent = [name for u_id, name in cursor.fetchall() if _is_work_day(cursor, u_id, date_str)]
 
         # Har bir xodim uchun shu oyning haqiqiy ish kuni normasini (bog'lanish
         # yopilmasdan oldin) hisoblab olamiz.
         month_prefix = date_str[:7]
         norm_map = {
             u_id: _norm_days_for_month(cursor, u_id, month_prefix, fallback_norm_d)
-            for u_id, _fn, _ci, _co, _lt, _rs, _bm, _wh, _ms, fallback_norm_d in rows
+            for u_id, _fn, _ci, _co, _lt, _rs, _bm, _wh, _ph, _ms, fallback_norm_d in rows
         }
 
     wb = openpyxl.Workbook()
@@ -529,7 +683,8 @@ def _generate_daily_excel_report_sync(date_str: str, file_path: str):
 
     headers = [
         "Xodim F.I.Sh", "Kelgan vaqti", "Ketgan vaqti", "Kechikish (daq)",
-        "Kechikish sababi", "Tanaffus (daq)", "Ishlangan soat", "Kunlik topilgan pul"
+        "Kechikish sababi", "Tanaffus (daq)", "Ishlangan soat", "To'lanadigan soat (2x bilan)",
+        "Kunlik topilgan pul"
     ]
     ws.append(headers)
 
@@ -541,10 +696,11 @@ def _generate_daily_excel_report_sync(date_str: str, file_path: str):
         cell.font = header_font
         cell.alignment = Alignment(horizontal="center", vertical="center")
 
-    for u_id, full_name, check_in, check_out, lateness, reason, break_min, work_hours, m_salary, _fallback in rows:
+    for u_id, full_name, check_in, check_out, lateness, reason, break_min, work_hours, paid_hours, m_salary, _fallback in rows:
         norm_d = norm_map.get(u_id, 26)
         hourly_rate = (m_salary / (norm_d * 8)) if norm_d and norm_d > 0 else 0
-        daily_earned = (work_hours or 0) * hourly_rate
+        effective_paid_hours = paid_hours if paid_hours else (work_hours or 0)
+        daily_earned = effective_paid_hours * hourly_rate
         ws.append([
             full_name,
             check_in or "-",
@@ -553,6 +709,7 @@ def _generate_daily_excel_report_sync(date_str: str, file_path: str):
             reason or "",
             break_min or 0,
             round(work_hours or 0, 2),
+            round(effective_paid_hours, 2),
             round(daily_earned, 2)
         ])
 
@@ -560,7 +717,7 @@ def _generate_daily_excel_report_sync(date_str: str, file_path: str):
         absent_fill = PatternFill(start_color="FDEAEA", end_color="FDEAEA", fill_type="solid")
         for name in absent:
             row_idx = ws.max_row + 1
-            ws.append([name, "KELMADI", "-", 0, "", 0, 0, 0])
+            ws.append([name, "KELMADI", "-", 0, "", 0, 0, 0, 0])
             for col_num in range(1, len(headers) + 1):
                 ws.cell(row=row_idx, column=col_num).fill = absent_fill
 
@@ -587,6 +744,8 @@ def _get_checkin_reminder_targets_sync(today_str: str, now_hm: str):
         users = cursor.fetchall()
         targets = []
         for user_id, full_name, work_start in users:
+            if not _is_work_day(cursor, user_id, today_str):
+                continue
             start = work_start or WORK_START_TIME
             try:
                 start_dt = datetime.strptime(start, "%H:%M")
@@ -647,6 +806,8 @@ def _get_checkout_reminder_targets_sync(today_str: str, now_hm: str):
         users = cursor.fetchall()
         targets = []
         for user_id, full_name, work_end in users:
+            if not _is_work_day(cursor, user_id, today_str):
+                continue
             end = work_end or WORK_END_TIME
             try:
                 end_dt = datetime.strptime(end, "%H:%M")
@@ -688,6 +849,63 @@ async def send_checkout_reminders():
             logger.info(f"Foydalanuvchi {user_id} botni bloklagan, eslatma yuborilmadi.")
         except Exception as e:
             logger.error(f"Chiqish eslatmasini yuborishda xatolik ({user_id}): {e}")
+
+
+def _get_auto_close_targets_sync(today_str: str, now_hm: str):
+    """"Avto-ketish" (auto_checkout_enabled) yoqilgan xodimlar orasida bugun
+    kelib, hali "Ishdan ketdim" bosmagan va ish tugash vaqti aynan HOZIR
+    bo'lgan xodimlarni topadi."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT user_id, full_name, work_end_time FROM users "
+            "WHERE is_approved = 1 AND auto_checkout_enabled = 1"
+        )
+        users = cursor.fetchall()
+        targets = []
+        for user_id, full_name, work_end in users:
+            end = work_end or WORK_END_TIME
+            if end != now_hm:
+                continue
+            cursor.execute(
+                "SELECT id FROM attendance WHERE user_id = ? AND date = ? "
+                "AND check_in_time IS NOT NULL AND check_out_time IS NULL",
+                (user_id, today_str)
+            )
+            if cursor.fetchone():
+                targets.append((user_id, full_name))
+        return targets
+
+
+async def auto_close_checkouts():
+    """Har daqiqada ishga tushadi: "avto-ketish" belgilangan xodimlar orasida
+    bugun kelib, lekin "Ishdan ketdim" bosmagan va ish tugash vaqti aynan
+    HOZIR bo'lganlarni topib, ularni tizim o'zi shu vaqtda "ketdi" deb
+    belgilaydi (mehnat intizomi: ish vaqtidan keyin ketgan deb yozilmasin)."""
+    now = get_now()
+    today_str = now.strftime("%Y-%m-%d")
+    now_hm = now.strftime("%H:%M")
+    targets = await run_db(_get_auto_close_targets_sync, today_str, now_hm)
+
+    for user_id, full_name in targets:
+        status, payload = await run_db(_checkout_sync, user_id, today_str, now.strftime("%H:%M:%S"))
+        if status != "ok":
+            continue
+        (_net_work_hours, _autoclosed, _added, _u_data,
+         _paid_hours, _clamped, effective_time_str) = payload
+        try:
+            await bot.send_message(
+                chat_id=user_id,
+                text=(
+                    f"ℹ️ Ish vaqtingiz tugagani uchun tizim sizni bugun soat "
+                    f"<b>{esc(effective_time_str[:5])}</b> da avtomatik ketdi deb belgiladi."
+                ),
+                parse_mode="HTML"
+            )
+        except TelegramForbiddenError:
+            logger.info(f"Foydalanuvchi {user_id} botni bloklagan, avto-ketish xabari yuborilmadi.")
+        except Exception as e:
+            logger.error(f"Avto-ketish xabarini yuborishda xatolik ({user_id}): {e}")
 
 
 async def send_daily_report():
@@ -1012,9 +1230,16 @@ async def ask_location_for_checkin(message: types.Message):
 
 def _checkout_sync(user_id: int, today_str: str, current_time_str: str):
     """Ishdan chiqishni yozib qo'yadi, agar tanaffus yopilmagan bo'lsa avtomatik yopadi.
+
+    Agar shu xodim uchun "avto-ketish" qoidasi (auto_checkout_enabled) yoqilgan
+    bo'lsa va u ish tugash vaqtidan (masalan 18:00) KECH bosgan bo'lsa - ketish
+    vaqti sifatida haqiqiy bosgan vaqti emas, balki ish tugash vaqti yoziladi
+    (agar 18:00'gacha bossa - o'zi bosgan haqiqiy vaqt yoziladi, o'zgarishsiz).
+
     Natija: (status, payload)
       status == "no_checkin" -> yozuv topilmadi
-      status == "ok" -> (net_work_hours, break_autoclosed(bool), break_minutes_added)
+      status == "ok" -> (net_work_hours, break_autoclosed(bool), break_minutes_added, u_data,
+                          paid_hours, clamped(bool), effective_time_str)
     """
     with get_db() as conn:
         cursor = conn.cursor()
@@ -1035,30 +1260,55 @@ def _checkout_sync(user_id: int, today_str: str, current_time_str: str):
 
         now = get_now()
 
+        cursor.execute(
+            "SELECT work_end_time, auto_checkout_enabled, overtime_eligible FROM users WHERE user_id = ?",
+            (user_id,)
+        )
+        flags_row = cursor.fetchone()
+        work_end = (flags_row[0] if flags_row and flags_row[0] else WORK_END_TIME)
+        auto_checkout_enabled = bool(flags_row[1]) if flags_row else False
+        overtime_eligible = bool(flags_row[2]) if flags_row else False
+
+        work_end_dt = datetime.strptime(f"{today_str} {work_end}", "%Y-%m-%d %H:%M").replace(tzinfo=TASHKENT_TZ)
+
+        clamped = auto_checkout_enabled and now > work_end_dt
+        effective_now = work_end_dt if clamped else now
+        effective_time_str = effective_now.strftime("%H:%M:%S")
+
         # Agar tanaffus boshlangan-u, hali yopilmagan bo'lsa - avtomatik yopamiz
+        # (klemp qilingan bo'lsa, effective_now'dan keyin yopilmasin)
         if break_start and not break_end:
             break_start_dt = datetime.strptime(
                 f"{today_str} {break_start}", "%Y-%m-%d %H:%M:%S"
             ).replace(tzinfo=TASHKENT_TZ)
-            added_break_minutes = int((now - break_start_dt).total_seconds() / 60)
+            break_end_dt = min(now, effective_now) if clamped else now
+            if break_end_dt < break_start_dt:
+                break_end_dt = break_start_dt
+            added_break_minutes = int((break_end_dt - break_start_dt).total_seconds() / 60)
             break_minutes += added_break_minutes
             break_autoclosed = True
             cursor.execute(
                 "UPDATE attendance SET break_end = ?, break_minutes = ? WHERE id = ?",
-                (now.strftime("%H:%M:%S"), break_minutes, record_id)
+                (break_end_dt.strftime("%H:%M:%S"), break_minutes, record_id)
             )
 
         check_in_dt = datetime.strptime(
             f"{today_str} {check_in_time}", "%Y-%m-%d %H:%M:%S"
         ).replace(tzinfo=TASHKENT_TZ)
-        total_seconds = (now - check_in_dt).total_seconds()
+        total_seconds = (effective_now - check_in_dt).total_seconds()
 
         break_seconds = break_minutes * 60
         net_work_hours = round(max(0, total_seconds - break_seconds) / 3600, 2)
 
+        paid_hours = _compute_paid_hours(
+            today_str, check_in_time, effective_time_str, break_minutes, overtime_eligible
+        )
+
+        checkout_source = "auto" if clamped else "self"
         cursor.execute(
-            "UPDATE attendance SET check_out_time = ?, work_hours = ? WHERE id = ?",
-            (current_time_str, net_work_hours, record_id)
+            "UPDATE attendance SET check_out_time = ?, work_hours = ?, paid_hours = ?, "
+            "checkout_source = ? WHERE id = ?",
+            (effective_time_str, net_work_hours, paid_hours, checkout_source, record_id)
         )
         conn.commit()
 
@@ -1068,7 +1318,8 @@ def _checkout_sync(user_id: int, today_str: str, current_time_str: str):
             computed_norm = _norm_days_for_month(cursor, user_id, today_str[:7], u_data[1])
             u_data = (u_data[0], computed_norm)
 
-    return "ok", (net_work_hours, break_autoclosed, added_break_minutes, u_data)
+    return "ok", (net_work_hours, break_autoclosed, added_break_minutes, u_data,
+                   paid_hours, clamped, effective_time_str)
 
 
 @dp.message(F.location, AttendanceState.waiting_for_checkout_location)
@@ -1105,24 +1356,35 @@ async def process_checkout_location(message: types.Message, state: FSMContext):
         await state.clear()
         return
 
-    net_work_hours, break_autoclosed, added_break_minutes, u_data = payload
+    (net_work_hours, break_autoclosed, added_break_minutes, u_data,
+     paid_hours, clamped, effective_time_str) = payload
 
     m_salary = u_data[0] if u_data else 0.0
     norm_d = u_data[1] if u_data and u_data[1] > 0 else 26
 
     hourly_rate = m_salary / (norm_d * 8) if (norm_d * 8) > 0 else 0
-    daily_earned = net_work_hours * hourly_rate
+    daily_earned = paid_hours * hourly_rate
 
     extra_note = ""
     if break_autoclosed:
-        extra_note = (
+        extra_note += (
             f"\nℹ️ Tanaffusdan qaytganingizni belgilamagan edingiz, shuning uchun "
             f"tanaffus avtomatik yopildi ({added_break_minutes} daqiqa qo'shildi)."
+        )
+    if clamped:
+        extra_note += (
+            f"\nℹ️ Ish vaqtingiz ({effective_time_str[:5]}) tugagani uchun tizim ketish "
+            f"vaqtingizni avtomatik shu vaqtga belgiladi."
+        )
+    if paid_hours != net_work_hours:
+        extra_note += (
+            f"\n⭐ Kech qolgan/yakshanba soatlari 2 barobar hisobga olindi "
+            f"(to'lanadigan soat: <b>{paid_hours}</b>)."
         )
 
     await message.answer(
         f"🔴 <b>Ishdan ketganingiz belgilandi!</b>\n"
-        f"⏰ Ketish vaqti: <b>{current_time_str}</b>\n"
+        f"⏰ Ketish vaqti: <b>{effective_time_str}</b>\n"
         f"⏱ Ishlangan net-vaqt: <b>{net_work_hours} soat</b>\n"
         f"💰 Bugungi ishlagan pulingiz: <b>{daily_earned:,.0f} so'm</b>"
         f"{extra_note}",
@@ -1186,10 +1448,7 @@ async def handle_location(message: types.Message, state: FSMContext):
     current_time_str = now.strftime("%H:%M:%S")
 
     user_work_start, _ = await run_db(_get_user_work_hours_sync, user_id)
-    work_start = datetime.strptime(f"{today_str} {user_work_start}", "%Y-%m-%d %H:%M").replace(tzinfo=TASHKENT_TZ)
-    lateness = 0
-    if now > work_start:
-        lateness = int((now - work_start).total_seconds() / 60)
+    lateness = _compute_lateness_minutes(today_str, current_time_str, user_work_start)
 
     attendance_id = await run_db(_checkin_sync, user_id, today_str, current_time_str, lateness)
 
@@ -1383,6 +1642,12 @@ async def handle_checkout_request(message: types.Message, state: FSMContext):
                 f"ℹ️ Admin tomonidan siz bugun soat <b>{esc(record[2])}</b> da ketgan deb belgilangansiz.",
                 parse_mode="HTML"
             )
+        elif checkout_source == "auto":
+            await message.answer(
+                f"ℹ️ Ish vaqtingiz tugagani uchun tizim sizni bugun soat <b>{esc(record[2])}</b> "
+                f"da avtomatik ketdi deb belgiladi.",
+                parse_mode="HTML"
+            )
         else:
             await message.answer(f"⚠️ Siz bugun soat <b>{esc(record[2])}</b> da ketganingiz belgilangan!", parse_mode="HTML")
         return
@@ -1396,7 +1661,8 @@ def _get_user_stats_sync(user_id: int, month_prefix: str):
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute('''
-            SELECT COUNT(id), COALESCE(SUM(lateness_minutes), 0), COALESCE(SUM(work_hours), 0.0), COALESCE(SUM(break_minutes), 0)
+            SELECT COUNT(id), COALESCE(SUM(lateness_minutes), 0), COALESCE(SUM(work_hours), 0.0),
+                   COALESCE(SUM(break_minutes), 0), COALESCE(SUM(paid_hours), 0.0)
             FROM attendance WHERE user_id = ? AND date LIKE ?
         ''', (user_id, f"{month_prefix}%"))
         row = cursor.fetchone()
@@ -1427,12 +1693,18 @@ async def cmd_user_stats(message: types.Message):
 
     hourly_rate = monthly_salary / (norm_days * 8) if (norm_days * 8) > 0 else 0.0
     total_work_hours = row[2]
-    total_earned = total_work_hours * hourly_rate
+    total_paid_hours = row[4]
+    total_earned = total_paid_hours * hourly_rate
+
+    extra_line = ""
+    if round(total_paid_hours, 2) != round(total_work_hours, 2):
+        extra_line = f"⭐ 2x (kech/yakshanba) hisobga olingan soat: <b>{round(total_paid_hours, 1)} soat</b>\n"
 
     stats_text = (
         f"📊 <b>Shu oy bo'yicha statistikangiz:</b>\n\n"
         f"📅 Ishga kelgan kunlar: <b>{row[0]} kun</b>\n"
         f"⏱ Jami ishlangan net-soat: <b>{round(total_work_hours, 1)} soat</b>\n"
+        f"{extra_line}"
         f"☕ Jami tanaffus vaqti: <b>{row[3]} daqiqa</b>\n"
         f"⚠️ Jami kechikish: <b>{row[1]} daqiqa</b>\n"
         f"💵 Belgilangan oylik: <b>{monthly_salary:,.0f} so'm</b> (Norma: {norm_days} kun)\n"
@@ -1454,10 +1726,11 @@ def _get_salary_details_sync(user_id: int, month_prefix: str):
         user_info = (user_info[0], user_info[1], computed_norm)
 
         cursor.execute(
-            "SELECT COALESCE(SUM(work_hours), 0.0) FROM attendance WHERE user_id = ? AND date LIKE ?",
+            "SELECT COALESCE(SUM(work_hours), 0.0), COALESCE(SUM(paid_hours), 0.0) "
+            "FROM attendance WHERE user_id = ? AND date LIKE ?",
             (user_id, f"{month_prefix}%")
         )
-        total_hours = cursor.fetchone()[0]
+        raw_hours, total_hours = cursor.fetchone()
 
         cursor.execute(
             "SELECT COALESCE(SUM(amount), 0.0) FROM advances WHERE user_id = ? AND date LIKE ?",
@@ -1465,7 +1738,7 @@ def _get_salary_details_sync(user_id: int, month_prefix: str):
         )
         total_advance = cursor.fetchone()[0]
 
-        return user_info, total_hours, total_advance
+        return user_info, total_hours, total_advance, raw_hours
 
 
 @dp.message(F.text == "💰 Mening oyligim")
@@ -1484,12 +1757,21 @@ async def cmd_my_salary(message: types.Message):
         await message.answer("⚠️ Ma'lumot topilmadi.")
         return
 
-    user_info, total_hours, total_advance = result
+    user_info, total_hours, total_advance, raw_hours = result
     full_name, m_salary, norm_days = user_info
 
     hourly_rate = m_salary / (norm_days * 8) if (norm_days * 8) > 0 else 0.0
+    # to'lov FAQAT to'lanadigan soatga (paid_hours - 2x hisoblangan kech/yakshanba
+    # soatlari bilan) nisbatan hisoblanadi, shunday qilib qo'shimcha haq avtomatik
+    # umumiy ish haqiga qo'shiladi.
     gross_earned = total_hours * hourly_rate
     net_payable = gross_earned - total_advance
+
+    extra_line = ""
+    if round(total_hours, 2) != round(raw_hours, 2):
+        extra_line = (
+            f"⭐ Jumladan 2x (kech/yakshanba) hisobga olingan holda: <b>{round(total_hours, 1)} soat</b>\n"
+        )
 
     text = (
         f"💰 <b>Sizning joriy oylik hisob-kitobingiz:</b>\n\n"
@@ -1498,7 +1780,8 @@ async def cmd_my_salary(message: types.Message):
         f"📅 Ish kuni normasi: <b>{norm_days} kun</b>\n"
         f"⏱ 1 soatlik ish haqi: <b>{hourly_rate:,.0f} so'm</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"📈 Shu oygacha ishlangan soat: <b>{round(total_hours, 1)} soat</b>\n"
+        f"📈 Shu oygacha ishlangan soat: <b>{round(raw_hours, 1)} soat</b>\n"
+        f"{extra_line}"
         f"💵 Ishlangan umumiy pul: <b>{gross_earned:,.0f} so'm</b>\n"
         f"💸 Olingan avanslar: <b>{total_advance:,.0f} so'm</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
@@ -1666,6 +1949,7 @@ def _get_employee_status_sync(today_str: str):
         for user_id, full_name, work_start in users:
             if user_id in ADMIN_IDS:
                 continue
+            is_today_work_day = _is_work_day(cursor, user_id, today_str)
             cursor.execute(
                 "SELECT check_in_time, check_out_time, lateness_minutes FROM attendance "
                 "WHERE user_id = ? AND date = ?",
@@ -1673,7 +1957,11 @@ def _get_employee_status_sync(today_str: str):
             )
             record = cursor.fetchone()
             if not record:
-                kelmagan.append((user_id, full_name))
+                # Faqat shu xodim uchun BUGUN ish kuni bo'lsagina "kelmagan" deb
+                # belgilanadi - aks holda (masalan admin dam olish kuni qilib
+                # belgilagan bo'lsa) u ro'yxatga umuman kiritilmaydi.
+                if is_today_work_day:
+                    kelmagan.append((user_id, full_name))
             elif record[1] is None:
                 ishda.append((full_name, record[0], record[2]))
             else:
@@ -1818,46 +2106,126 @@ def _set_work_time_sync(user_id: int, start_time: str, end_time: str):
         conn.commit()
 
 
-def _admin_set_attendance_sync(user_id: int, today_str: str, check_in_time: str, check_out_time: str | None, work_start: str):
+def _compute_work_and_paid_hours(date_str: str, check_in_time: str, check_out_time: str,
+                                  break_minutes: float, overtime_eligible: bool):
+    """Ishlangan net-soat va to'lanadigan (2x hisobga olingan) soatni birga qaytaradi."""
+    in_fmt = "%H:%M:%S" if check_in_time.count(":") == 2 else "%H:%M"
+    out_fmt = "%H:%M:%S" if check_out_time.count(":") == 2 else "%H:%M"
+    check_in_dt = datetime.strptime(f"{date_str} {check_in_time}", f"%Y-%m-%d {in_fmt}")
+    check_out_dt = datetime.strptime(f"{date_str} {check_out_time}", f"%Y-%m-%d {out_fmt}")
+    if check_out_dt < check_in_dt:
+        check_out_dt += timedelta(days=1)
+    break_seconds = max(0.0, break_minutes or 0.0) * 60
+    work_hours = round(max(0.0, (check_out_dt - check_in_dt).total_seconds() - break_seconds) / 3600, 2)
+    paid_hours = _compute_paid_hours(date_str, check_in_time, check_out_time, break_minutes, overtime_eligible)
+    return work_hours, paid_hours
+
+
+def _admin_get_attendance_sync(user_id: int, date_str: str):
+    """Berilgan xodim va sana uchun mavjud davomat yozuvini qaytaradi - admin
+    panelida shu kunni tahrirlashda mavjud qiymatlarni oldindan ko'rsatish uchun."""
     with get_db() as conn:
         cursor = conn.cursor()
+        cursor.execute(
+            "SELECT check_in_time, check_out_time, lateness_minutes, break_minutes, "
+            "work_hours, paid_hours, checkin_source, checkout_source "
+            "FROM attendance WHERE user_id = ? AND date = ?",
+            (user_id, date_str)
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return {
+            "check_in": (row[0] or "")[:5],
+            "check_out": (row[1] or "")[:5],
+            "lateness_minutes": row[2] or 0,
+            "break_minutes": row[3] or 0,
+            "work_hours": row[4] or 0,
+            "paid_hours": row[5] or 0,
+            "checkin_source": row[6],
+            "checkout_source": row[7],
+        }
 
-        work_start_dt = datetime.strptime(f"{today_str} {work_start}", "%Y-%m-%d %H:%M")
-        check_in_dt = datetime.strptime(f"{today_str} {check_in_time}", "%Y-%m-%d %H:%M")
-        lateness = max(0, int((check_in_dt - work_start_dt).total_seconds() / 60))
 
-        work_hours = 0.0
-        if check_out_time:
-            check_out_dt = datetime.strptime(f"{today_str} {check_out_time}", "%Y-%m-%d %H:%M")
-            work_hours = round(max(0, (check_out_dt - check_in_dt).total_seconds()) / 3600, 2)
+def _admin_set_checkin_sync(user_id: int, date_str: str, check_in_time: str, work_start: str):
+    """Admin tomonidan FAQAT kelish vaqtini kiritadi/o'zgartiradi. Ketish vaqtiga
+    umuman tegmaydi - ikkalasi bir-biridan MUSTAQIL. Agar ketish vaqti
+    allaqachon mavjud bo'lsa, ishlangan soat/to'lanadigan soat shu yangi
+    kelish vaqtiga nisbatan qayta hisoblanadi."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        lateness = _compute_lateness_minutes(date_str, check_in_time, work_start)
+        check_in_str = f"{check_in_time}:00"
 
-        cursor.execute("SELECT id FROM attendance WHERE user_id = ? AND date = ?", (user_id, today_str))
+        cursor.execute(
+            "SELECT id, check_out_time, break_minutes FROM attendance WHERE user_id = ? AND date = ?",
+            (user_id, date_str)
+        )
         existing = cursor.fetchone()
 
-        check_in_str = f"{check_in_time}:00"
-        check_out_str = f"{check_out_time}:00" if check_out_time else None
+        cursor.execute("SELECT overtime_eligible FROM users WHERE user_id = ?", (user_id,))
+        overtime_row = cursor.fetchone()
+        overtime_eligible = bool(overtime_row[0]) if overtime_row else False
 
         if existing:
+            record_id, check_out_time, break_minutes = existing
             if check_out_time:
+                work_hours, paid_hours = _compute_work_and_paid_hours(
+                    date_str, check_in_str, check_out_time, break_minutes or 0, overtime_eligible
+                )
                 cursor.execute(
-                    "UPDATE attendance SET check_in_time = ?, check_out_time = ?, lateness_minutes = ?, "
-                    "work_hours = ?, checkin_source = 'admin', checkout_source = 'admin' WHERE id = ?",
-                    (check_in_str, check_out_str, lateness, work_hours, existing[0])
+                    "UPDATE attendance SET check_in_time = ?, lateness_minutes = ?, "
+                    "work_hours = ?, paid_hours = ?, checkin_source = 'admin' WHERE id = ?",
+                    (check_in_str, lateness, work_hours, paid_hours, record_id)
                 )
             else:
                 cursor.execute(
                     "UPDATE attendance SET check_in_time = ?, lateness_minutes = ?, "
                     "checkin_source = 'admin' WHERE id = ?",
-                    (check_in_str, lateness, existing[0])
+                    (check_in_str, lateness, record_id)
                 )
         else:
             cursor.execute(
-                "INSERT INTO attendance (user_id, date, check_in_time, check_out_time, lateness_minutes, "
-                "work_hours, checkin_source, checkout_source) VALUES (?, ?, ?, ?, ?, ?, 'admin', ?)",
-                (user_id, today_str, check_in_str, check_out_str, lateness, work_hours,
-                 'admin' if check_out_time else 'self')
+                "INSERT INTO attendance (user_id, date, check_in_time, lateness_minutes, checkin_source) "
+                "VALUES (?, ?, ?, ?, 'admin')",
+                (user_id, date_str, check_in_str, lateness)
             )
         conn.commit()
+        return True
+
+
+def _admin_set_checkout_sync(user_id: int, date_str: str, check_out_time: str):
+    """Admin tomonidan FAQAT ketish vaqtini kiritadi/o'zgartiradi. Kelish
+    vaqtini qayta kiritish SHART EMAS - agar kelish yozuvi allaqachon mavjud
+    bo'lsa, undan mustaqil saqlanadi. Agar shu sana uchun kelish yozuvi umuman
+    bo'lmasa - False qaytaradi (chunki ketish nimadan hisoblanishi noaniq)."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, check_in_time, break_minutes FROM attendance WHERE user_id = ? AND date = ?",
+            (user_id, date_str)
+        )
+        existing = cursor.fetchone()
+        if not existing or not existing[1]:
+            return False
+
+        record_id, check_in_time, break_minutes = existing
+        check_out_str = f"{check_out_time}:00"
+
+        cursor.execute("SELECT overtime_eligible FROM users WHERE user_id = ?", (user_id,))
+        overtime_row = cursor.fetchone()
+        overtime_eligible = bool(overtime_row[0]) if overtime_row else False
+
+        work_hours, paid_hours = _compute_work_and_paid_hours(
+            date_str, check_in_time, check_out_str, break_minutes or 0, overtime_eligible
+        )
+        cursor.execute(
+            "UPDATE attendance SET check_out_time = ?, work_hours = ?, paid_hours = ?, "
+            "checkout_source = 'admin' WHERE id = ?",
+            (check_out_str, work_hours, paid_hours, record_id)
+        )
+        conn.commit()
+        return True
 
 
 def _add_advance_sync(user_id: int, amount: float, date_str: str):
@@ -1899,6 +2267,10 @@ async def main():
     # 18:00 da tugasa - 17:45/17:50/17:55 da), shuning uchun har daqiqada tekshiriladi.
     scheduler.add_job(send_checkin_reminders, trigger="cron", day_of_week="mon-sat", minute="*")
     scheduler.add_job(send_checkout_reminders, trigger="cron", day_of_week="mon-sat", minute="*")
+    # "Avto-ketish" belgilangan xodimlar (masalan menejer/dizaynerlar) uchun -
+    # har kuni (yakshanba ham) ishlaydi, chunki ular yakshanba kuni ham kelib
+    # qolishi mumkin va shu holatda ham ish tugash vaqtida avtomatik yopilishi kerak.
+    scheduler.add_job(auto_close_checkouts, trigger="cron", minute="*")
     scheduler.add_job(send_admin_daily_summary, trigger="cron", day_of_week="mon-sat", hour=18, minute=5)
     scheduler.add_job(send_admin_weekly_summary, trigger="cron", day_of_week="sun", hour=20, minute=0)
     scheduler.add_job(send_daily_report, trigger="cron", hour=21, minute=0)

@@ -188,14 +188,16 @@ def api_users():
     for uid, full_name, approved, salary in users:
         if uid in bot_main.ADMIN_IDS:
             continue
-        start, end = bot_main._get_user_work_hours_sync(uid)
+        flags = bot_main._get_user_flags_sync(uid)
         result.append({
             "user_id": uid,
             "name": full_name,
             "approved": bool(approved),
-            "work_start": start,
-            "work_end": end,
+            "work_start": flags["work_start"],
+            "work_end": flags["work_end"],
             "salary": salary or 0,
+            "auto_checkout_enabled": flags["auto_checkout_enabled"],
+            "overtime_eligible": flags["overtime_eligible"],
         })
     return jsonify({"users": result})
 
@@ -442,8 +444,40 @@ def api_workdays_clear():
     return jsonify({"ok": True})
 
 
-@app.post("/webapp/api/attendance")
-def api_attendance():
+def _parse_date_or_today(raw_date):
+    """Berilgan 'YYYY-MM-DD' sanani tekshiradi; bo'sh/berilmagan bo'lsa bugungi
+    sanani qaytaradi. Admin endi FAQAT bugungi kun bilan cheklanmaydi - o'tgan
+    kunlar uchun ham davomatni kiritishi/tuzatishi mumkin."""
+    today_str = bot_main.get_now().strftime("%Y-%m-%d")
+    if not raw_date:
+        return today_str
+    datetime.strptime(raw_date, "%Y-%m-%d")  # ValueError -> chaqiruvchi tutadi
+    return raw_date
+
+
+@app.get("/webapp/api/attendance")
+def api_attendance_get():
+    """Berilgan xodim va sana uchun mavjud davomat yozuvini qaytaradi (admin
+    panelida shu kunni tahrirlashda mavjud qiymatlarni oldindan ko'rsatish uchun)."""
+    user = _require_admin()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+
+    try:
+        uid = int(request.args.get("user_id"))
+        date_str = _parse_date_or_today(request.args.get("date"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "invalid_input"}), 400
+
+    record = bot_main._admin_get_attendance_sync(uid, date_str)
+    return jsonify({"date": date_str, "record": record})
+
+
+@app.post("/webapp/api/attendance/checkin")
+def api_attendance_checkin():
+    """Admin tomonidan FAQAT kelish vaqtini kiritadi - ketish vaqtini kiritish
+    talab qilinmaydi, ikkalasi bir-biridan mustaqil saqlanadi. `date`
+    berilmasa bugungi kun, aks holda istalgan o'tgan kun uchun ishlaydi."""
     user = _require_admin()
     if not user:
         return jsonify({"error": "unauthorized"}), 401
@@ -452,26 +486,74 @@ def api_attendance():
     try:
         uid = int(body["user_id"])
         check_in = datetime.strptime(body["check_in"], "%H:%M").strftime("%H:%M")
-        check_out_raw = body.get("check_out") or None
-        check_out = (
-            datetime.strptime(check_out_raw, "%H:%M").strftime("%H:%M")
-            if check_out_raw else None
-        )
+        date_str = _parse_date_or_today(body.get("date"))
     except (KeyError, ValueError, TypeError):
         return jsonify({"error": "invalid_input"}), 400
 
-    today_str = bot_main.get_now().strftime("%Y-%m-%d")
     work_start, _ = bot_main._get_user_work_hours_sync(uid)
-    bot_main._admin_set_attendance_sync(uid, today_str, check_in, check_out, work_start)
+    bot_main._admin_set_checkin_sync(uid, date_str, check_in, work_start)
 
-    if check_out:
-        notify = (
-            f"ℹ️ Admin tomonidan sizning bugungi davomatingiz kiritildi:\n"
-            f"Kelgan vaqt: {check_in}\nKetgan vaqt: {check_out}"
-        )
+    today_str = bot_main.get_now().strftime("%Y-%m-%d")
+    if date_str == today_str:
+        _send_telegram_message(uid, f"ℹ️ Admin tomonidan siz bugun soat {check_in} da kelgan deb belgilandingiz.")
     else:
-        notify = f"ℹ️ Admin tomonidan siz bugun soat {check_in} da kelgan deb belgilandingiz."
-    _send_telegram_message(uid, notify)
+        _send_telegram_message(uid, f"ℹ️ Admin tomonidan {date_str} kuni soat {check_in} da kelgan deb belgilandingiz.")
+
+    return jsonify({"ok": True})
+
+
+@app.post("/webapp/api/attendance/checkout")
+def api_attendance_checkout():
+    """Admin tomonidan FAQAT ketish vaqtini kiritadi - kelish vaqtini qayta
+    kiritish talab qilinmaydi. Agar shu sana uchun kelish yozuvi umuman
+    bo'lmasa - xato qaytaradi (avval kelish vaqtini kiritish kerak)."""
+    user = _require_admin()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+
+    body = request.get_json(force=True, silent=True) or {}
+    try:
+        uid = int(body["user_id"])
+        check_out = datetime.strptime(body["check_out"], "%H:%M").strftime("%H:%M")
+        date_str = _parse_date_or_today(body.get("date"))
+    except (KeyError, ValueError, TypeError):
+        return jsonify({"error": "invalid_input"}), 400
+
+    ok = bot_main._admin_set_checkout_sync(uid, date_str, check_out)
+    if not ok:
+        return jsonify({"error": "no_checkin", "message": "Avval shu kun uchun kelish vaqtini kiriting"}), 400
+
+    today_str = bot_main.get_now().strftime("%Y-%m-%d")
+    if date_str == today_str:
+        _send_telegram_message(uid, f"ℹ️ Admin tomonidan siz bugun soat {check_out} da ketgan deb belgilandingiz.")
+    else:
+        _send_telegram_message(uid, f"ℹ️ Admin tomonidan {date_str} kuni soat {check_out} da ketgan deb belgilandingiz.")
+
+    return jsonify({"ok": True})
+
+
+@app.post("/webapp/api/employee/flags")
+def api_employee_flags():
+    """Admin xodim uchun maxsus qoidalarni belgilaydi:
+    - auto_checkout_enabled: ish tugash vaqtidan keyin "Ketdim" bossa (yoki
+      umuman bosmasa) tizim ketish vaqtini avtomatik ish tugash vaqtiga
+      belgilaydi (masalan menejer/dizaynerlar uchun).
+    - overtime_eligible: 21:00'dan keyingi va yakshanba kunidagi soatlar
+      2 barobar hisoblanadi (masalan ishlab chiqarish xodimlari uchun)."""
+    user = _require_admin()
+    if not user:
+        return jsonify({"error": "unauthorized"}), 401
+
+    body = request.get_json(force=True, silent=True) or {}
+    try:
+        uid = int(body["user_id"])
+    except (KeyError, ValueError, TypeError):
+        return jsonify({"error": "invalid_input"}), 400
+
+    if "auto_checkout_enabled" in body:
+        bot_main._set_auto_checkout_sync(uid, bool(body["auto_checkout_enabled"]))
+    if "overtime_eligible" in body:
+        bot_main._set_overtime_eligible_sync(uid, bool(body["overtime_eligible"]))
 
     return jsonify({"ok": True})
 
@@ -679,13 +761,27 @@ function renderManageCard(nowStr) {
         <div><label class="meta">Ish boshlash</label><input id="workStart" placeholder="09:00"></div>
         <div><label class="meta">Ish tugash</label><input id="workEnd" placeholder="18:00"></div>
       </div>
-      <button style="width:100%;margin-bottom:12px" id="saveSchedule">⏰ Ish vaqtini saqlash</button>
+      <button style="width:100%;margin-bottom:8px" id="saveSchedule">⏰ Ish vaqtini saqlash</button>
 
-      <div class="grid2">
-        <div><label class="meta">Bugun kelgan</label><input id="checkIn" placeholder="08:30"></div>
-        <div><label class="meta">Bugun ketgan (ixtiyoriy)</label><input id="checkOut" placeholder="17:30"></div>
+      <div style="margin-bottom:14px">
+        <label style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
+          <input type="checkbox" id="autoCheckoutFlag"> <span class="meta" style="margin:0">Avto-ketish: ish tugagach (yoki "Ketdim" kech bosilsa) tizim ketishni ish tugash vaqtiga avtomatik belgilasin</span>
+        </label>
+        <label style="display:flex;align-items:center;gap:6px">
+          <input type="checkbox" id="overtimeFlag"> <span class="meta" style="margin:0">2x haq: 21:00'dan keyingi va yakshanba kunidagi soatlar 2 barobar hisoblansin</span>
+        </label>
       </div>
-      <button style="width:100%;margin-bottom:14px" id="saveAttendance">🕐 Davomatni qo'lda kiritish</button>
+
+      <div><label class="meta">Davomat sanasi (o'tgan kunlarni ham tuzatish mumkin)</label><input id="attDate" type="date"></div>
+      <div class="grid2">
+        <div><label class="meta">Kelgan vaqti</label><input id="checkIn" placeholder="08:30"></div>
+        <div><label class="meta">Ketgan vaqti</label><input id="checkOut" placeholder="17:30"></div>
+      </div>
+      <div class="grid2">
+        <button style="width:100%;margin-bottom:14px" id="saveCheckin">🟢 Kelishni saqlash</button>
+        <button style="width:100%;margin-bottom:14px" id="saveCheckout">🔴 Ketishni saqlash</button>
+      </div>
+      <div class="meta" id="attInfo" style="margin:-8px 0 14px"></div>
 
       <div><label class="meta">Avans miqdori (so'm)</label><input id="advanceAmount" placeholder="500000" inputmode="numeric"></div>
       <button style="width:100%;margin-bottom:14px" id="saveAdvance">💸 Avans berish</button>
@@ -823,6 +919,34 @@ async function loadUsersInto(card, calState) {
   attachCalendarNav(card, calState);
 
   const body = card.querySelector("#manageBody");
+
+  function todayStr() {
+    const d = nowStr ? new Date(nowStr.replace(" ", "T")) : new Date();
+    return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
+  }
+
+  async function loadAttendanceFor(uid, dateStr) {
+    const info = card.querySelector("#attInfo");
+    info.textContent = "Yuklanmoqda...";
+    try {
+      const r = await api(`/webapp/api/attendance?user_id=${uid}&date=${dateStr}`);
+      const rec = r.record;
+      card.querySelector("#checkIn").value = rec ? rec.check_in : "";
+      card.querySelector("#checkOut").value = rec ? rec.check_out : "";
+      if (!rec) {
+        info.textContent = "Shu kun uchun yozuv yo'q.";
+      } else {
+        const parts = [];
+        if (rec.lateness_minutes) parts.push(`kechikish: ${rec.lateness_minutes} daq.`);
+        if (rec.work_hours) parts.push(`ishlagan: ${rec.work_hours} soat`);
+        if (rec.paid_hours && rec.paid_hours !== rec.work_hours) parts.push(`to'lanadigan: ${rec.paid_hours} soat`);
+        info.textContent = parts.length ? parts.join(", ") : "Yozuv mavjud.";
+      }
+    } catch (e) {
+      info.textContent = "Xatolik: " + e.message;
+    }
+  }
+
   select.addEventListener("change", (ev) => {
     if (!confirmDiscardIfDirty(calState)) { select.value = calState.userId || ""; return; }
     const u = usersCache.find(x => String(x.user_id) === select.value);
@@ -832,11 +956,39 @@ async function loadUsersInto(card, calState) {
     card.querySelector("#empSalary").value = u.salary || "";
     card.querySelector("#workStart").value = u.work_start;
     card.querySelector("#workEnd").value = u.work_end;
-    card.querySelector("#checkIn").value = "";
-    card.querySelector("#checkOut").value = "";
+    card.querySelector("#autoCheckoutFlag").checked = !!u.auto_checkout_enabled;
+    card.querySelector("#overtimeFlag").checked = !!u.overtime_eligible;
+    card.querySelector("#attDate").value = todayStr();
     card.querySelector("#advanceAmount").value = "";
     calState.userId = u.user_id;
     loadCalendar(card, calState);
+    loadAttendanceFor(u.user_id, todayStr());
+  });
+
+  card.querySelector("#attDate").addEventListener("change", () => {
+    if (!select.value) return;
+    const d = card.querySelector("#attDate").value;
+    if (d) loadAttendanceFor(select.value, d);
+  });
+
+  card.querySelector("#autoCheckoutFlag").addEventListener("change", async (ev) => {
+    if (!select.value) return;
+    try {
+      await api("/webapp/api/employee/flags", {method: "POST", body: JSON.stringify({
+        user_id: select.value, auto_checkout_enabled: ev.target.checked,
+      })});
+      toast("Saqlandi ✅");
+    } catch (e) { toast("Xatolik: " + e.message); }
+  });
+
+  card.querySelector("#overtimeFlag").addEventListener("change", async (ev) => {
+    if (!select.value) return;
+    try {
+      await api("/webapp/api/employee/flags", {method: "POST", body: JSON.stringify({
+        user_id: select.value, overtime_eligible: ev.target.checked,
+      })});
+      toast("Saqlandi ✅");
+    } catch (e) { toast("Xatolik: " + e.message); }
   });
 
   card.querySelector("#saveName").addEventListener("click", async () => {
@@ -878,19 +1030,34 @@ async function loadUsersInto(card, calState) {
     } catch (e) { toast("Xatolik: " + e.message); }
   });
 
-  card.querySelector("#saveAttendance").addEventListener("click", async () => {
+  card.querySelector("#saveCheckin").addEventListener("click", async () => {
     if (!select.value) return;
     const checkIn = card.querySelector("#checkIn").value.trim();
+    const dateStr = card.querySelector("#attDate").value || todayStr();
     if (!checkIn) { toast("Kelish vaqtini kiriting"); return; }
     try {
-      await api("/webapp/api/attendance", {method: "POST", body: JSON.stringify({
-        user_id: select.value,
-        check_in: checkIn,
-        check_out: card.querySelector("#checkOut").value.trim() || null,
+      await api("/webapp/api/attendance/checkin", {method: "POST", body: JSON.stringify({
+        user_id: select.value, check_in: checkIn, date: dateStr,
       })});
-      toast("Davomat saqlandi ✅");
+      toast("Kelish vaqti saqlandi ✅");
+      loadAttendanceFor(select.value, dateStr);
       loadStatus();
     } catch (e) { toast("Xatolik: " + e.message); }
+  });
+
+  card.querySelector("#saveCheckout").addEventListener("click", async () => {
+    if (!select.value) return;
+    const checkOut = card.querySelector("#checkOut").value.trim();
+    const dateStr = card.querySelector("#attDate").value || todayStr();
+    if (!checkOut) { toast("Ketish vaqtini kiriting"); return; }
+    try {
+      await api("/webapp/api/attendance/checkout", {method: "POST", body: JSON.stringify({
+        user_id: select.value, check_out: checkOut, date: dateStr,
+      })});
+      toast("Ketish vaqti saqlandi ✅");
+      loadAttendanceFor(select.value, dateStr);
+      loadStatus();
+    } catch (e) { toast("Xatolik: " + (e.message === "no_checkin" ? "Avval shu kun uchun kelish vaqtini kiriting" : e.message)); }
   });
 
   card.querySelector("#saveAdvance").addEventListener("click", async () => {
