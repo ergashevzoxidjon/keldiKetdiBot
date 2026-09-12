@@ -164,12 +164,12 @@ def api_status():
     return jsonify({
         "now": bot_main.get_now().strftime("%Y-%m-%d %H:%M"),
         "ishda": [
-            {"name": name, "check_in": ci, "lateness": lateness}
-            for name, ci, lateness in ishda
+            {"user_id": uid, "name": name, "check_in": ci, "lateness": lateness}
+            for uid, name, ci, lateness in ishda
         ],
         "ketgan": [
-            {"name": name, "check_in": ci, "check_out": co}
-            for name, ci, co in ketgan
+            {"user_id": uid, "name": name, "check_in": ci, "check_out": co}
+            for uid, name, ci, co in ketgan
         ],
         "kelmagan": [
             {"user_id": uid, "name": name} for uid, name in kelmagan
@@ -635,6 +635,22 @@ ADMIN_PAGE_HTML = """<!doctype html>
   }
   .calcell.marked { background: var(--tg-theme-button-color, #2481cc); color: var(--tg-theme-button-text-color, #fff); font-weight: 700; }
   .calcell:active { opacity: .7; }
+  .emp-card {
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    padding: 10px 4px; border-bottom: 1px solid rgba(0,0,0,.06); cursor: pointer;
+  }
+  .emp-card:last-child { border-bottom: none; }
+  .emp-card:active { opacity: .7; }
+  .emp-card.selected { background: rgba(36,129,204,.08); border-radius: 10px; }
+  .emp-main { min-width: 0; flex: 1; }
+  .emp-chevron { opacity: .3; font-size: 18px; }
+  .detail-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; margin-bottom: 12px; }
+  .detail-header .name { font-size: 16px; }
+  .section-title {
+    font-size: 11px; font-weight: 700; opacity: .55; text-transform: uppercase;
+    letter-spacing: .04em; margin: 16px 0 8px; border-top: 1px solid rgba(0,0,0,.08); padding-top: 12px;
+  }
+  .section-title:first-of-type { margin-top: 0; border-top: none; padding-top: 0; }
 </style>
 </head>
 <body>
@@ -689,143 +705,185 @@ function el(html) {
   return d.firstChild;
 }
 
-let usersCache = [];
+let usersCache = [];       // /webapp/api/users dan - ism, oylik, ish vaqti, flag'lar
+let employeesCache = [];   // /webapp/api/status dan - bugungi holat (ishda/ketgan/kelmagan)
+let detailCardEl = null;   // xodim tafsiloti (bitta, qayta ishlatiladigan) karta
+let calState = null;
+let lastNowStr = null;
+const state = { currentUserId: null };
 
 async function loadStatus() {
-  const data = await api("/webapp/api/status");
+  const [statusData, usersData] = await Promise.all([
+    api("/webapp/api/status"),
+    api("/webapp/api/users"),
+  ]);
+  usersCache = usersData.users;
+  lastNowStr = statusData.now;
+
+  employeesCache = [
+    ...statusData.ishda.map(u => Object.assign({}, u, {status: "ishda"})),
+    ...statusData.ketgan.map(u => Object.assign({}, u, {status: "ketgan"})),
+    ...statusData.kelmagan.map(u => Object.assign({}, u, {status: "kelmagan"})),
+  ];
+
+  const prevId = state.currentUserId;
+
   const app = document.getElementById("app");
   app.innerHTML = "";
-
-  app.appendChild(renderSection("🟢 Ishda", data.ishda.map(u =>
-    `<div class="row"><div><div class="name">${escapeHtml(u.name)}</div>
-      <div class="meta">${escapeHtml(u.check_in || "").slice(0,5)} dan${u.lateness ? " · ⚠️ " + u.lateness + " daq. kech" : ""}</div></div>
-      <span class="badge b-green">ishda</span></div>`
-  ).join("") || `<div class="empty">Hozircha yo'q</div>`));
-
-  app.appendChild(renderSection("🔴 Ketgan", data.ketgan.map(u =>
-    `<div class="row"><div><div class="name">${escapeHtml(u.name)}</div>
-      <div class="meta">${escapeHtml((u.check_in||"").slice(0,5))} – ${escapeHtml((u.check_out||"").slice(0,5))}</div></div>
-      <span class="badge b-gray">ketgan</span></div>`
-  ).join("") || `<div class="empty">Hozircha yo'q</div>`));
-
-  const kelmaganRows = data.kelmagan.map(u =>
-    `<div class="row"><div class="name">${escapeHtml(u.name)}</div>
-      <button data-nudge="${u.user_id}" class="secondary">🔔 Eslatish</button></div>`
-  ).join("");
-  const kelmaganCard = renderSection(
-    `⏳ Kelmagan (${data.kelmagan.length})`,
-    kelmaganRows || `<div class="empty">Hammasi kelgan ✅</div>`
-  );
-  if (data.kelmagan.length) {
-    const allBtn = el(`<button style="width:100%;margin-top:8px" data-nudge="all">🔔 Hammasiga eslatma yuborish</button>`);
-    kelmaganCard.appendChild(allBtn);
-  }
-  app.appendChild(kelmaganCard);
-
-  app.querySelectorAll("[data-nudge]").forEach(btn => {
-    btn.addEventListener("click", async () => {
-      btn.disabled = true;
-      try {
-        const r = await api("/webapp/api/nudge", {method: "POST", body: JSON.stringify({user_id: btn.dataset.nudge})});
-        toast(r.sent ? `Yuborildi (${r.sent})` : "Yuborilmadi");
-      } catch (e) { toast("Xatolik: " + e.message); }
-      btn.disabled = false;
-    });
-  });
-
-  app.appendChild(renderManageCard(data.now));
+  app.appendChild(renderEmployeesCard(statusData));
+  detailCardEl = renderDetailCard();
+  app.appendChild(detailCardEl);
   app.appendChild(renderAddEmployeeCard());
+
+  state.currentUserId = null;
+  if (prevId && employeesCache.some(e => String(e.user_id) === String(prevId))) {
+    // Ro'yxat yangilangach ham (masalan biror amal saqlangandan keyin)
+    // ochiq turgan xodim panelini yopib qo'ymaymiz - shu tufayli admin
+    // "yo'qolib qoldi" deb chalg'imaydi.
+    openEmployeeDetail(prevId, true);
+  }
 }
 
-function renderSection(title, innerHtml) {
-  const card = document.createElement("div");
-  card.className = "card";
-  card.innerHTML = `<h2>${title}</h2>${innerHtml}`;
-  return card;
+function statusMetaText(u) {
+  if (u.status === "ishda") {
+    return `${(u.check_in || "").slice(0, 5)} dan${u.lateness ? " · ⚠️ " + u.lateness + " daq. kech" : ""}`;
+  }
+  if (u.status === "ketgan") {
+    return `${(u.check_in || "").slice(0, 5)} – ${(u.check_out || "").slice(0, 5)}`;
+  }
+  return "Hali kelmagan";
 }
 
-function renderManageCard(nowStr) {
+function statusBadgeHtml(u) {
+  if (u.status === "ishda") return `<span class="badge b-green">ishda</span>`;
+  if (u.status === "ketgan") return `<span class="badge b-gray">ketgan</span>`;
+  return `<span class="badge b-red">kelmagan</span>`;
+}
+
+function renderEmployeesCard(statusData) {
   const card = document.createElement("div");
   card.className = "card";
-  card.innerHTML = `
-    <h2>⚙️ Xodimni boshqarish</h2>
-    <select id="userSelect"><option value="">Xodimni tanlang...</option></select>
-    <div id="manageBody" style="display:none">
-      <div><label class="meta">F.I.Sh</label><input id="empName" placeholder="Ism Familiya"></div>
-      <button style="width:100%;margin-bottom:12px" id="saveName">✏️ Ismini saqlash</button>
+  card.id = "employeesCard";
 
-      <div><label class="meta">Belgilangan oylik (so'm)</label><input id="empSalary" placeholder="5000000" inputmode="numeric"></div>
-      <button style="width:100%;margin-bottom:14px" id="saveSalary">💰 Oylikni saqlash</button>
-
-      <div class="grid2">
-        <div><label class="meta">Ish boshlash</label><input id="workStart" placeholder="09:00"></div>
-        <div><label class="meta">Ish tugash</label><input id="workEnd" placeholder="18:00"></div>
+  const rows = employeesCache.map(u => `
+    <div class="emp-card" data-uid="${u.user_id}">
+      <div class="emp-main">
+        <div class="name">${escapeHtml(u.name)}</div>
+        <div class="meta">${escapeHtml(statusMetaText(u))}</div>
       </div>
-      <button style="width:100%;margin-bottom:8px" id="saveSchedule">⏰ Ish vaqtini saqlash</button>
-
-      <div style="margin-bottom:14px">
-        <label style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
-          <input type="checkbox" id="autoCheckoutFlag"> <span class="meta" style="margin:0">Avto-ketish: ish tugagach (yoki "Ketdim" kech bosilsa) tizim ketishni ish tugash vaqtiga avtomatik belgilasin</span>
-        </label>
-        <label style="display:flex;align-items:center;gap:6px">
-          <input type="checkbox" id="overtimeFlag"> <span class="meta" style="margin:0">2x haq: 21:00'dan keyingi va yakshanba kunidagi soatlar 2 barobar hisoblansin</span>
-        </label>
-      </div>
-
-      <div><label class="meta">Davomat sanasi (o'tgan kunlarni ham tuzatish mumkin)</label><input id="attDate" type="date"></div>
-      <div class="grid2">
-        <div><label class="meta">Kelgan vaqti</label><input id="checkIn" placeholder="08:30"></div>
-        <div><label class="meta">Ketgan vaqti</label><input id="checkOut" placeholder="17:30"></div>
-      </div>
-      <div class="grid2">
-        <button style="width:100%;margin-bottom:14px" id="saveCheckin">🟢 Kelishni saqlash</button>
-        <button style="width:100%;margin-bottom:14px" id="saveCheckout">🔴 Ketishni saqlash</button>
-      </div>
-      <div class="meta" id="attInfo" style="margin:-8px 0 14px"></div>
-
-      <div><label class="meta">Avans miqdori (so'm)</label><input id="advanceAmount" placeholder="500000" inputmode="numeric"></div>
-      <button style="width:100%;margin-bottom:14px" id="saveAdvance">💸 Avans berish</button>
-
-      <div style="border-top:1px solid rgba(0,0,0,.08);padding-top:10px">
-        <label class="meta">🗓 Ish kunlari (kalendar) — shu oy normasi</label>
-        <div class="calnav">
-          <button class="secondary" id="calPrev">◀</button>
-          <span id="calLabel" style="font-weight:600"></span>
-          <button class="secondary" id="calNext">▶</button>
-        </div>
-        <div class="calgrid" id="calGrid"></div>
-        <div class="meta" id="calCount" style="margin:8px 0"></div>
-        <button class="secondary" style="width:100%;margin-bottom:8px" id="calClear">🗑 Shu oyni tozalash</button>
-        <button style="width:100%" id="calSave">💾 Saqlash</button>
-      </div>
-
-      <div style="border-top:1px solid rgba(0,0,0,.08);padding-top:10px;margin-top:12px">
-        <button style="width:100%;background:#fdeaea;color:#c62828" id="deleteEmp">❌ Xodimni butunlay o'chirish</button>
-      </div>
+      ${statusBadgeHtml(u)}
+      <span class="emp-chevron">›</span>
     </div>
+  `).join("");
+
+  card.innerHTML = `
+    <h2>👥 Xodimlar (${employeesCache.length})</h2>
+    <div id="employeeList">${rows || `<div class="empty">Hali tasdiqlangan xodim yo'q</div>`}</div>
   `;
 
-  const now = nowStr ? new Date(nowStr.replace(" ", "T")) : new Date();
-  const calState = {
-    userId: null,
-    year: now.getFullYear(),
-    month: now.getMonth() + 1, // 1-12
-    marked: new Set(),   // hozir ekranda belgilangan kunlar (mahalliy, hali saqlanmagan bo'lishi mumkin)
-    dirty: false,        // saqlanmagan o'zgarish bormi
-  };
+  if (statusData.kelmagan.length) {
+    const allBtn = el(`<button style="width:100%;margin-top:10px" id="nudgeAll">🔔 Hammasiga eslatma yuborish (${statusData.kelmagan.length})</button>`);
+    allBtn.addEventListener("click", () => sendNudge("all", allBtn));
+    card.appendChild(allBtn);
+  }
 
-  loadUsersInto(card, calState);
+  card.querySelectorAll(".emp-card").forEach(row => {
+    row.addEventListener("click", () => openEmployeeDetail(row.dataset.uid));
+  });
+
   return card;
+}
+
+async function sendNudge(target, btn) {
+  btn.disabled = true;
+  try {
+    const r = await api("/webapp/api/nudge", {method: "POST", body: JSON.stringify({user_id: target})});
+    toast(r.sent ? `Yuborildi (${r.sent})` : "Yuborilmadi");
+  } catch (e) { toast("Xatolik: " + e.message); }
+  btn.disabled = false;
+}
+
+function todayStr() {
+  const d = lastNowStr ? new Date(lastNowStr.replace(" ", "T")) : new Date();
+  return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
+}
+
+async function loadAttendanceFor(uid, dateStr) {
+  const card = detailCardEl;
+  const info = card.querySelector("#attInfo");
+  info.textContent = "Yuklanmoqda...";
+  try {
+    const r = await api(`/webapp/api/attendance?user_id=${uid}&date=${dateStr}`);
+    const rec = r.record;
+    card.querySelector("#checkIn").value = rec ? rec.check_in : "";
+    card.querySelector("#checkOut").value = rec ? rec.check_out : "";
+    if (!rec) {
+      info.textContent = "Shu kun uchun yozuv yo'q.";
+    } else {
+      const parts = [];
+      if (rec.lateness_minutes) parts.push(`kechikish: ${rec.lateness_minutes} daq.`);
+      if (rec.work_hours) parts.push(`ishlagan: ${rec.work_hours} soat`);
+      if (rec.paid_hours && rec.paid_hours !== rec.work_hours) parts.push(`to'lanadigan: ${rec.paid_hours} soat`);
+      info.textContent = parts.length ? parts.join(", ") : "Yozuv mavjud.";
+    }
+  } catch (e) {
+    info.textContent = "Xatolik: " + e.message;
+  }
+}
+
+function openEmployeeDetail(uid, silent) {
+  uid = String(uid);
+  const u = usersCache.find(x => String(x.user_id) === uid);
+  if (!u) { toast("Xodim topilmadi"); return; }
+  const statusInfo = employeesCache.find(x => String(x.user_id) === uid);
+
+  state.currentUserId = uid;
+
+  document.querySelectorAll(".emp-card").forEach(row => {
+    row.classList.toggle("selected", row.dataset.uid === uid);
+  });
+
+  const card = detailCardEl;
+  card.style.display = "block";
+  card.querySelector("#detailName").textContent = u.name;
+  card.querySelector("#detailStatusMeta").textContent = statusInfo ? statusMetaText(statusInfo) : "";
+  const nudgeBtn = card.querySelector("#detailNudge");
+  nudgeBtn.hidden = !(statusInfo && statusInfo.status === "kelmagan");
+
+  card.querySelector("#empName").value = u.name;
+  card.querySelector("#empSalary").value = u.salary || "";
+  card.querySelector("#workStart").value = u.work_start;
+  card.querySelector("#workEnd").value = u.work_end;
+  card.querySelector("#autoCheckoutFlag").checked = !!u.auto_checkout_enabled;
+  card.querySelector("#overtimeFlag").checked = !!u.overtime_eligible;
+
+  const today = todayStr();
+  card.querySelector("#attDate").value = today;
+  card.querySelector("#advanceAmount").value = "";
+
+  calState.dirty = false;
+  loadCalendar(card);
+  loadAttendanceFor(uid, today);
+
+  if (!silent) {
+    card.scrollIntoView({behavior: "smooth", block: "start"});
+  }
+}
+
+function closeEmployeeDetail() {
+  state.currentUserId = null;
+  detailCardEl.style.display = "none";
+  document.querySelectorAll(".emp-card").forEach(row => row.classList.remove("selected"));
 }
 
 function ymStr(y, m) { return `${y}-${String(m).padStart(2, "0")}`; }
 
-function confirmDiscardIfDirty(calState) {
+function confirmDiscardIfDirty() {
   if (!calState.dirty) return true;
   return confirm("Kalendarda saqlanmagan o'zgarishlar bor. Ularni tashlab, davom etasizmi?");
 }
 
-function renderCalGrid(card, calState, daysInMonth) {
+function renderCalGrid(card, daysInMonth) {
   const grid = card.querySelector("#calGrid");
   const count = card.querySelector("#calCount");
   grid.innerHTML = "";
@@ -843,57 +901,65 @@ function renderCalGrid(card, calState, daysInMonth) {
   }
 }
 
-async function loadCalendar(card, calState) {
-  if (!calState.userId) return;
+async function loadCalendar(card) {
+  if (!state.currentUserId) return;
   const monthStr = ymStr(calState.year, calState.month);
   const label = card.querySelector("#calLabel");
   const count = card.querySelector("#calCount");
   label.textContent = monthStr;
   card.querySelector("#calGrid").innerHTML = `<div class="empty">Yuklanmoqda...</div>`;
+  count.textContent = "";
 
   let data;
   try {
-    data = await api(`/webapp/api/workdays?user_id=${calState.userId}&month=${monthStr}`);
+    data = await api(`/webapp/api/workdays?user_id=${state.currentUserId}&month=${monthStr}`);
   } catch (e) {
     card.querySelector("#calGrid").innerHTML = `<div class="empty">Xatolik: ${escapeHtml(e.message)}</div>`;
+    console.error("Kalendar yuklanmadi:", e);
+    return;
+  }
+
+  if (!data || typeof data.days_in_month !== "number") {
+    card.querySelector("#calGrid").innerHTML = `<div class="empty">Kalendar ma'lumoti noto'g'ri keldi.</div>`;
+    console.error("Kalendar: kutilmagan javob", data);
     return;
   }
 
   calState.daysInMonth = data.days_in_month;
-  calState.marked = new Set(data.marked);
+  calState.marked = new Set(data.marked || []);
   calState.dirty = false;
-  renderCalGrid(card, calState, data.days_in_month);
+  renderCalGrid(card, data.days_in_month);
   count.textContent = `${data.count} kun belgilangan (shu oy normasi)`;
 }
 
-function attachCalendarNav(card, calState) {
+function attachCalendarNav(card) {
   card.querySelector("#calPrev").addEventListener("click", () => {
-    if (!confirmDiscardIfDirty(calState)) return;
+    if (!confirmDiscardIfDirty()) return;
     calState.month -= 1;
     if (calState.month < 1) { calState.month = 12; calState.year -= 1; }
-    loadCalendar(card, calState);
+    loadCalendar(card);
   });
   card.querySelector("#calNext").addEventListener("click", () => {
-    if (!confirmDiscardIfDirty(calState)) return;
+    if (!confirmDiscardIfDirty()) return;
     calState.month += 1;
     if (calState.month > 12) { calState.month = 1; calState.year += 1; }
-    loadCalendar(card, calState);
+    loadCalendar(card);
   });
   card.querySelector("#calClear").addEventListener("click", () => {
-    if (!calState.userId) return;
+    if (!state.currentUserId) return;
     calState.marked.clear();
     calState.dirty = true;
-    renderCalGrid(card, calState, calState.daysInMonth);
+    renderCalGrid(card, calState.daysInMonth);
     card.querySelector("#calCount").textContent = "0 kun belgilangan (saqlanmagan) - 💾 Saqlashni bosing";
   });
   card.querySelector("#calSave").addEventListener("click", async () => {
-    if (!calState.userId) return;
+    if (!state.currentUserId) return;
     try {
       const monthStr = ymStr(calState.year, calState.month);
       const r = await api("/webapp/api/workdays/set", {
         method: "POST",
         body: JSON.stringify({
-          user_id: calState.userId,
+          user_id: state.currentUserId,
           month: monthStr,
           days: Array.from(calState.marked),
         }),
@@ -905,168 +971,189 @@ function attachCalendarNav(card, calState) {
   });
 }
 
-async function loadUsersInto(card, calState) {
-  const data = await api("/webapp/api/users");
-  usersCache = data.users;
-  const select = card.querySelector("#userSelect");
-  usersCache.forEach(u => {
-    const opt = document.createElement("option");
-    opt.value = u.user_id;
-    opt.textContent = u.name + " (" + u.work_start + "-" + u.work_end + ")";
-    select.appendChild(opt);
-  });
+function renderDetailCard() {
+  const card = document.createElement("div");
+  card.className = "card";
+  card.id = "detailCard";
+  card.style.display = "none";
+  card.innerHTML = `
+    <div class="detail-header">
+      <div>
+        <div class="name" id="detailName">—</div>
+        <div class="meta" id="detailStatusMeta"></div>
+      </div>
+      <button class="secondary" id="detailClose">✕ Yopish</button>
+    </div>
 
-  attachCalendarNav(card, calState);
+    <button style="width:100%;margin-bottom:14px" id="detailNudge" hidden>🔔 Eslatma yuborish</button>
 
-  const body = card.querySelector("#manageBody");
+    <div class="section-title">Ma'lumotlari</div>
+    <div><label class="meta">F.I.Sh</label><input id="empName" placeholder="Ism Familiya"></div>
+    <button style="width:100%;margin-bottom:12px" id="saveName">✏️ Ismini saqlash</button>
 
-  function todayStr() {
-    const d = nowStr ? new Date(nowStr.replace(" ", "T")) : new Date();
-    return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
-  }
+    <div><label class="meta">Belgilangan oylik (so'm)</label><input id="empSalary" placeholder="5000000" inputmode="numeric"></div>
+    <button style="width:100%;margin-bottom:14px" id="saveSalary">💰 Oylikni saqlash</button>
 
-  async function loadAttendanceFor(uid, dateStr) {
-    const info = card.querySelector("#attInfo");
-    info.textContent = "Yuklanmoqda...";
-    try {
-      const r = await api(`/webapp/api/attendance?user_id=${uid}&date=${dateStr}`);
-      const rec = r.record;
-      card.querySelector("#checkIn").value = rec ? rec.check_in : "";
-      card.querySelector("#checkOut").value = rec ? rec.check_out : "";
-      if (!rec) {
-        info.textContent = "Shu kun uchun yozuv yo'q.";
-      } else {
-        const parts = [];
-        if (rec.lateness_minutes) parts.push(`kechikish: ${rec.lateness_minutes} daq.`);
-        if (rec.work_hours) parts.push(`ishlagan: ${rec.work_hours} soat`);
-        if (rec.paid_hours && rec.paid_hours !== rec.work_hours) parts.push(`to'lanadigan: ${rec.paid_hours} soat`);
-        info.textContent = parts.length ? parts.join(", ") : "Yozuv mavjud.";
-      }
-    } catch (e) {
-      info.textContent = "Xatolik: " + e.message;
-    }
-  }
+    <div class="section-title">Ish vaqti</div>
+    <div class="grid2">
+      <div><label class="meta">Ish boshlash</label><input id="workStart" placeholder="09:00"></div>
+      <div><label class="meta">Ish tugash</label><input id="workEnd" placeholder="18:00"></div>
+    </div>
+    <button style="width:100%;margin-bottom:8px" id="saveSchedule">⏰ Ish vaqtini saqlash</button>
+    <div style="margin-bottom:14px">
+      <label style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
+        <input type="checkbox" id="autoCheckoutFlag"> <span class="meta" style="margin:0">Avto-ketish: ish tugagach (yoki "Ketdim" kech bosilsa) tizim ketishni ish tugash vaqtiga avtomatik belgilasin</span>
+      </label>
+      <label style="display:flex;align-items:center;gap:6px">
+        <input type="checkbox" id="overtimeFlag"> <span class="meta" style="margin:0">2x haq: 21:00'dan keyingi va yakshanba kunidagi soatlar 2 barobar hisoblansin</span>
+      </label>
+    </div>
 
-  select.addEventListener("change", (ev) => {
-    if (!confirmDiscardIfDirty(calState)) { select.value = calState.userId || ""; return; }
-    const u = usersCache.find(x => String(x.user_id) === select.value);
-    if (!u) { body.style.display = "none"; calState.userId = null; return; }
-    body.style.display = "block";
-    card.querySelector("#empName").value = u.name;
-    card.querySelector("#empSalary").value = u.salary || "";
-    card.querySelector("#workStart").value = u.work_start;
-    card.querySelector("#workEnd").value = u.work_end;
-    card.querySelector("#autoCheckoutFlag").checked = !!u.auto_checkout_enabled;
-    card.querySelector("#overtimeFlag").checked = !!u.overtime_eligible;
-    card.querySelector("#attDate").value = todayStr();
-    card.querySelector("#advanceAmount").value = "";
-    calState.userId = u.user_id;
-    loadCalendar(card, calState);
-    loadAttendanceFor(u.user_id, todayStr());
-  });
+    <div class="section-title">Davomat</div>
+    <div><label class="meta">Sana (o'tgan kunlarni ham tuzatish mumkin)</label><input id="attDate" type="date"></div>
+    <div class="grid2">
+      <div><label class="meta">Kelgan vaqti</label><input id="checkIn" placeholder="08:30"></div>
+      <div><label class="meta">Ketgan vaqti</label><input id="checkOut" placeholder="17:30"></div>
+    </div>
+    <div class="grid2">
+      <button style="width:100%;margin-bottom:14px" id="saveCheckin">🟢 Kelishni saqlash</button>
+      <button style="width:100%;margin-bottom:14px" id="saveCheckout">🔴 Ketishni saqlash</button>
+    </div>
+    <div class="meta" id="attInfo" style="margin:-8px 0 14px"></div>
+
+    <div class="section-title">Avans</div>
+    <div><label class="meta">Avans miqdori (so'm)</label><input id="advanceAmount" placeholder="500000" inputmode="numeric"></div>
+    <button style="width:100%;margin-bottom:14px" id="saveAdvance">💸 Avans berish</button>
+
+    <div class="section-title">🗓 Ish kunlari (kalendar) — shu oy normasi</div>
+    <div class="calnav">
+      <button class="secondary" id="calPrev">◀</button>
+      <span id="calLabel" style="font-weight:600"></span>
+      <button class="secondary" id="calNext">▶</button>
+    </div>
+    <div class="calgrid" id="calGrid"></div>
+    <div class="meta" id="calCount" style="margin:8px 0"></div>
+    <button class="secondary" style="width:100%;margin-bottom:8px" id="calClear">🗑 Shu oyni tozalash</button>
+    <button style="width:100%" id="calSave">💾 Saqlash</button>
+
+    <div style="border-top:1px solid rgba(0,0,0,.08);padding-top:10px;margin-top:16px">
+      <button style="width:100%;background:#fdeaea;color:#c62828" id="deleteEmp">❌ Xodimni butunlay o'chirish</button>
+    </div>
+  `;
+
+  const now = lastNowStr ? new Date(lastNowStr.replace(" ", "T")) : new Date();
+  calState = {
+    year: now.getFullYear(),
+    month: now.getMonth() + 1, // 1-12
+    marked: new Set(),   // hozir ekranda belgilangan kunlar (mahalliy, hali saqlanmagan bo'lishi mumkin)
+    dirty: false,        // saqlanmagan o'zgarish bormi
+    daysInMonth: 31,
+  };
+
+  card.querySelector("#detailClose").addEventListener("click", () => closeEmployeeDetail());
+  card.querySelector("#detailNudge").addEventListener("click", (ev) => sendNudge(state.currentUserId, ev.target));
 
   card.querySelector("#attDate").addEventListener("change", () => {
-    if (!select.value) return;
+    if (!state.currentUserId) return;
     const d = card.querySelector("#attDate").value;
-    if (d) loadAttendanceFor(select.value, d);
+    if (d) loadAttendanceFor(state.currentUserId, d);
   });
 
   card.querySelector("#autoCheckoutFlag").addEventListener("change", async (ev) => {
-    if (!select.value) return;
+    if (!state.currentUserId) return;
     try {
       await api("/webapp/api/employee/flags", {method: "POST", body: JSON.stringify({
-        user_id: select.value, auto_checkout_enabled: ev.target.checked,
+        user_id: state.currentUserId, auto_checkout_enabled: ev.target.checked,
       })});
       toast("Saqlandi ✅");
     } catch (e) { toast("Xatolik: " + e.message); }
   });
 
   card.querySelector("#overtimeFlag").addEventListener("change", async (ev) => {
-    if (!select.value) return;
+    if (!state.currentUserId) return;
     try {
       await api("/webapp/api/employee/flags", {method: "POST", body: JSON.stringify({
-        user_id: select.value, overtime_eligible: ev.target.checked,
+        user_id: state.currentUserId, overtime_eligible: ev.target.checked,
       })});
       toast("Saqlandi ✅");
     } catch (e) { toast("Xatolik: " + e.message); }
   });
 
   card.querySelector("#saveName").addEventListener("click", async () => {
-    if (!select.value) return;
+    if (!state.currentUserId) return;
     const name = card.querySelector("#empName").value.trim();
     if (!name) { toast("Ismni kiriting"); return; }
     try {
       await api("/webapp/api/employee/rename", {method: "POST", body: JSON.stringify({
-        user_id: select.value, name,
+        user_id: state.currentUserId, name,
       })});
       toast("Ism saqlandi ✅");
-      const opt = select.querySelector(`option[value="${select.value}"]`);
-      if (opt) opt.textContent = name + " (" + card.querySelector("#workStart").value + "-" + card.querySelector("#workEnd").value + ")";
+      await loadStatus();
     } catch (e) { toast("Xatolik: " + e.message); }
   });
 
   card.querySelector("#saveSalary").addEventListener("click", async () => {
-    if (!select.value) return;
+    if (!state.currentUserId) return;
     const salary = card.querySelector("#empSalary").value.trim();
     if (!salary) { toast("Oylik miqdorini kiriting"); return; }
     try {
       await api("/webapp/api/employee/salary", {method: "POST", body: JSON.stringify({
-        user_id: select.value, salary,
+        user_id: state.currentUserId, salary,
       })});
       toast("Oylik saqlandi ✅");
     } catch (e) { toast("Xatolik: " + e.message); }
   });
 
   card.querySelector("#saveSchedule").addEventListener("click", async () => {
-    if (!select.value) return;
+    if (!state.currentUserId) return;
     try {
       await api("/webapp/api/schedule", {method: "POST", body: JSON.stringify({
-        user_id: select.value,
+        user_id: state.currentUserId,
         work_start: card.querySelector("#workStart").value,
         work_end: card.querySelector("#workEnd").value,
       })});
-      toast("Ish vaqti saqlandi ✅");
-      loadUsersInto.cacheDirty = true;
+      toast("Ish vaqti saqlandi ✅ (bugungi kechikish ham qayta hisoblandi)");
+      await loadStatus();
     } catch (e) { toast("Xatolik: " + e.message); }
   });
 
   card.querySelector("#saveCheckin").addEventListener("click", async () => {
-    if (!select.value) return;
+    if (!state.currentUserId) return;
     const checkIn = card.querySelector("#checkIn").value.trim();
     const dateStr = card.querySelector("#attDate").value || todayStr();
     if (!checkIn) { toast("Kelish vaqtini kiriting"); return; }
     try {
       await api("/webapp/api/attendance/checkin", {method: "POST", body: JSON.stringify({
-        user_id: select.value, check_in: checkIn, date: dateStr,
+        user_id: state.currentUserId, check_in: checkIn, date: dateStr,
       })});
       toast("Kelish vaqti saqlandi ✅");
-      loadAttendanceFor(select.value, dateStr);
-      loadStatus();
+      await loadStatus();
+      await loadAttendanceFor(state.currentUserId, dateStr);
     } catch (e) { toast("Xatolik: " + e.message); }
   });
 
   card.querySelector("#saveCheckout").addEventListener("click", async () => {
-    if (!select.value) return;
+    if (!state.currentUserId) return;
     const checkOut = card.querySelector("#checkOut").value.trim();
     const dateStr = card.querySelector("#attDate").value || todayStr();
     if (!checkOut) { toast("Ketish vaqtini kiriting"); return; }
     try {
       await api("/webapp/api/attendance/checkout", {method: "POST", body: JSON.stringify({
-        user_id: select.value, check_out: checkOut, date: dateStr,
+        user_id: state.currentUserId, check_out: checkOut, date: dateStr,
       })});
       toast("Ketish vaqti saqlandi ✅");
-      loadAttendanceFor(select.value, dateStr);
-      loadStatus();
+      await loadStatus();
+      await loadAttendanceFor(state.currentUserId, dateStr);
     } catch (e) { toast("Xatolik: " + (e.message === "no_checkin" ? "Avval shu kun uchun kelish vaqtini kiriting" : e.message)); }
   });
 
   card.querySelector("#saveAdvance").addEventListener("click", async () => {
-    if (!select.value) return;
+    if (!state.currentUserId) return;
     const amount = card.querySelector("#advanceAmount").value.trim();
     if (!amount) { toast("Avans miqdorini kiriting"); return; }
     try {
       await api("/webapp/api/employee/advance", {method: "POST", body: JSON.stringify({
-        user_id: select.value, amount,
+        user_id: state.currentUserId, amount,
       })});
       toast("Avans saqlandi ✅");
       card.querySelector("#advanceAmount").value = "";
@@ -1074,18 +1161,22 @@ async function loadUsersInto(card, calState) {
   });
 
   card.querySelector("#deleteEmp").addEventListener("click", async () => {
-    if (!select.value) return;
-    const opt = select.querySelector(`option[value="${select.value}"]`);
-    const label = opt ? opt.textContent : select.value;
+    if (!state.currentUserId) return;
+    const label = card.querySelector("#detailName").textContent;
     if (!confirm(`${label} butunlay o'chirilsinmi? Bu amalni ortga qaytarib bo'lmaydi - barcha davomat va avans tarixi ham o'chib ketadi!`)) return;
     try {
       await api("/webapp/api/employee/delete", {method: "POST", body: JSON.stringify({
-        user_id: select.value,
+        user_id: state.currentUserId,
       })});
       toast("Xodim o'chirildi ✅");
-      loadStatus();
+      closeEmployeeDetail();
+      await loadStatus();
     } catch (e) { toast("Xatolik: " + e.message); }
   });
+
+  attachCalendarNav(card);
+
+  return card;
 }
 
 function renderAddEmployeeCard() {

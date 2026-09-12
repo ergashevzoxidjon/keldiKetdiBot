@@ -937,10 +937,10 @@ async def send_admin_daily_summary():
     necha kishi kelgan, necha kishi kelmagan, kimlar kech qolgan."""
     today_str = get_now().strftime("%Y-%m-%d")
     ishda, ketgan, kelmagan = await run_db(_get_employee_status_sync, today_str)
-    kelganlar = ishda + [(name, ci, None) for name, ci, co in ketgan]
+    kelganlar = ishda + [(uid, name, ci, None) for uid, name, ci, co in ketgan]
     total = len(kelganlar) + len(kelmagan)
 
-    late_list = [(name, lateness) for name, _, lateness in ishda if lateness and lateness > 0]
+    late_list = [(name, lateness) for _uid, name, _ci, lateness in ishda if lateness and lateness > 0]
 
     lines = [
         f"📋 <b>Kunlik xulosa</b> ({esc(today_str)}):\n",
@@ -1472,6 +1472,25 @@ async def handle_location(message: types.Message, state: FSMContext):
             parse_mode="HTML"
         )
         await state.set_state(AttendanceState.waiting_for_reason)
+
+        # Adminlarga DARHOL (sababni kutib turmasdan) xabar beramiz - shunda
+        # xabar HAQIQIY vaqtda yetib boradi. Xodim sababni keyinroq yozsa,
+        # o'sha sabab alohida qo'shimcha xabar sifatida yuboriladi (pastda,
+        # handle_lateness_reason ichida). Shu tufayli endi admin xabarni soat
+        # nechada ko'rishidan qat'iy nazar, undagi "Kelgan vaqti" doim HAQIQIY
+        # kelish vaqtini bildiradi.
+        immediate_alert = (
+            f"🚨 <b>KECHIKISH!</b>\n\n"
+            f"👤 Xodim: <b>{esc(message.from_user.full_name)}</b>\n"
+            f"⏰ Kelgan vaqti: <b>{esc(current_time_str)}</b>\n"
+            f"⏱ Kechikish: <b>{lateness} daqiqa</b>\n"
+            f"📝 Sababi: <i>kutilmoqda...</i>"
+        )
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(chat_id=admin_id, text=immediate_alert, parse_mode="HTML")
+            except Exception as e:
+                logger.error(f"Admin({admin_id})ga kechikish xabarini yuborishda xatolik: {e}")
     else:
         await message.answer(
             f"✅ <b>Ishga kelganingiz belgilandi!</b>\n⏰ Vaqt: <b>{current_time_str}</b>",
@@ -1497,8 +1516,12 @@ async def handle_lateness_reason(message: types.Message, state: FSMContext):
     kb = get_kb_for(user_id)
     await message.answer("✅ <b>Rahmat! Sabab saqlandi.</b>", reply_markup=kb, parse_mode="HTML")
 
-    admin_alert = (
-        f"🚨 <b>KECHIKISH VA SABAB!</b>\n\n"
+    # Kechikish haqidagi asosiy xabar xodim kelgan PAYTIDA (yuqorida,
+    # handle_location'da) allaqachon yuborilgan - bu yerda faqat sababni
+    # qo'shimcha xabar sifatida yuboramiz, shu bilan sabab qancha kech
+    # yozilishidan qat'iy nazar, asosiy xabar hech qachon kechikib bormaydi.
+    reason_alert = (
+        f"📝 <b>Kechikish sababi keldi</b>\n\n"
         f"👤 Xodim: <b>{esc(message.from_user.full_name)}</b>\n"
         f"⏰ Kelgan vaqti: <b>{esc(data['current_time'])}</b>\n"
         f"⏱ Kechikish: <b>{data['lateness']} daqiqa</b>\n"
@@ -1506,9 +1529,9 @@ async def handle_lateness_reason(message: types.Message, state: FSMContext):
     )
     for admin_id in ADMIN_IDS:
         try:
-            await bot.send_message(chat_id=admin_id, text=admin_alert, parse_mode="HTML")
+            await bot.send_message(chat_id=admin_id, text=reason_alert, parse_mode="HTML")
         except Exception as e:
-            logger.error(f"Admin({admin_id})ga kechikish xabarini yuborishda xatolik: {e}")
+            logger.error(f"Admin({admin_id})ga kechikish sababini yuborishda xatolik: {e}")
 
     await state.clear()
 
@@ -1963,9 +1986,9 @@ def _get_employee_status_sync(today_str: str):
                 if is_today_work_day:
                     kelmagan.append((user_id, full_name))
             elif record[1] is None:
-                ishda.append((full_name, record[0], record[2]))
+                ishda.append((user_id, full_name, record[0], record[2]))
             else:
-                ketgan.append((full_name, record[0], record[1]))
+                ketgan.append((user_id, full_name, record[0], record[1]))
         return ishda, ketgan, kelmagan
 
 
@@ -1982,7 +2005,7 @@ async def cmd_employee_status(message: types.Message):
 
     lines.append(f"🟢 <b>Ishda ({len(ishda)}):</b>")
     if ishda:
-        for name, check_in, lateness in ishda:
+        for _uid, name, check_in, lateness in ishda:
             late_note = f" (⚠️ {lateness} daq. kech)" if lateness and lateness > 0 else ""
             lines.append(f"  • {esc(name)} — {esc(check_in)[:5]} dan{late_note}")
     else:
@@ -1990,7 +2013,7 @@ async def cmd_employee_status(message: types.Message):
 
     lines.append(f"\n🔴 <b>Ketgan ({len(ketgan)}):</b>")
     if ketgan:
-        for name, check_in, check_out in ketgan:
+        for _uid, name, check_in, check_out in ketgan:
             lines.append(f"  • {esc(name)} — {esc(check_in)[:5]} - {esc(check_out)[:5]}")
     else:
         lines.append("  <i>Yo'q</i>")
@@ -2103,6 +2126,28 @@ def _set_work_time_sync(user_id: int, start_time: str, end_time: str):
             "UPDATE users SET work_start_time = ?, work_end_time = ? WHERE user_id = ?",
             (start_time, end_time, user_id)
         )
+
+        # Ish boshlash vaqti o'zgartirilganda, agar xodim uchun BUGUN allaqachon
+        # kelish belgilangan bo'lsa-yu hali ketmagan bo'lsa (masalan admin
+        # xodim kelib bo'lgach uning individual ish vaqtini sozlagan holat),
+        # o'sha kelishning kechikish daqiqasini YANGI vaqtga nisbatan QAYTA
+        # hisoblaymiz. Aks holda eski (masalan standart 09:00'ga nisbatan
+        # hisoblangan) noto'g'ri qiymat saqlanib qolar edi.
+        today_str = get_now().strftime("%Y-%m-%d")
+        cursor.execute(
+            "SELECT id, check_in_time FROM attendance "
+            "WHERE user_id = ? AND date = ? AND check_out_time IS NULL",
+            (user_id, today_str)
+        )
+        row = cursor.fetchone()
+        if row and row[1]:
+            record_id, check_in_time = row
+            new_lateness = _compute_lateness_minutes(today_str, check_in_time, start_time)
+            cursor.execute(
+                "UPDATE attendance SET lateness_minutes = ? WHERE id = ?",
+                (new_lateness, record_id)
+            )
+
         conn.commit()
 
 
