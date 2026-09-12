@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="uz">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Davomat</title>
+<link rel="stylesheet" href="style.css">
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+</head>
+<body>
+
+<div class="card">
+  <div class="greeting" id="greeting">Salom!</div>
+  <div class="subtext" id="today-date"></div>
+
+  <div class="status-row">
+    <span class="label">Kelgan vaqti</span>
+    <span class="value" id="s-checkin">—</span>
+  </div>
+  <div class="status-row">
+    <span class="label">Ketgan vaqti</span>
+    <span class="value" id="s-checkout">—</span>
+  </div>
+  <div class="status-row">
+    <span class="label">Holat</span>
+    <span class="value"><span class="badge" id="s-badge">Yuklanmoqda...</span></span>
+  </div>
+</div>
+
+<div id="action-area"></div>
+
+<div class="section-title">Shu oy</div>
+<div class="card grid-2">
+  <div class="stat-box"><div class="num" id="m-days">–</div><div class="label">Kelgan kun</div></div>
+  <div class="stat-box"><div class="num" id="m-hours">–</div><div class="label">Ishlangan soat</div></div>
+  <div class="stat-box"><div class="num" id="m-late">–</div><div class="label">Kechikish (daq)</div></div>
+  <div class="stat-box"><div class="num" id="m-earned">–</div><div class="label">Topilgan (so'm)</div></div>
+</div>
+
+<div class="section-title">Oylik hisob-kitob</div>
+<div class="card">
+  <div class="status-row"><span class="label">Belgilangan oylik</span><span class="value" id="sal-monthly">–</span></div>
+  <div class="status-row"><span class="label">Ishlangan pul</span><span class="value" id="sal-gross">–</span></div>
+  <div class="status-row"><span class="label">Olingan avans</span><span class="value" id="sal-advance">–</span></div>
+  <div class="status-row"><span class="label"><b>Qo'lga tegadigan</b></span><span class="value" id="sal-net"><b>–</b></span></div>
+</div>
+
+<div class="section-title">Bu oy kalendari</div>
+<div class="card">
+  <div class="calendar" id="calendar"></div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

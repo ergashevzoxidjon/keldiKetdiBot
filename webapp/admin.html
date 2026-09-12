@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="uz">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Admin panel</title>
+<link rel="stylesheet" href="style.css">
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+</head>
+<body>
+
+<div class="tabs">
+  <div class="tab active" data-tab="pending">Kutilmoqda</div>
+  <div class="tab" data-tab="users">Xodimlar</div>
+  <div class="tab" data-tab="report">Hisobot</div>
+  <div class="tab" data-tab="broadcast">Xabarnoma</div>
+</div>
+
+<div id="tab-pending">
+  <div class="section-title">Tasdiq kutayotganlar</div>
+  <div class="card"><div class="pill-list" id="pending-list"><div class="loader">Yuklanmoqda...</div></div></div>
+</div>
+
+<div id="tab-users" style="display:none">
+  <div class="section-title">Barcha xodimlar</div>
+  <div class="card"><div class="pill-list" id="users-list"><div class="loader">Yuklanmoqda...</div></div></div>
+  <button class="btn secondary" id="add-user-btn">➕ Yangi xodim qo'shish</button>
+</div>
+
+<div id="tab-report" style="display:none">
+  <div class="section-title">Kunlik hisobot</div>
+  <div class="card">
+    <input type="date" id="daily-date" style="width:100%;padding:10px;border-radius:10px;border:1px solid var(--border);margin-bottom:10px;">
+    <button class="btn secondary" id="daily-load-btn">Ko'rish</button>
+    <button class="btn" id="daily-xlsx-btn">📥 Excel yuklab olish</button>
+    <div id="daily-result"></div>
+  </div>
+
+  <div class="section-title">Oylik hisobot</div>
+  <div class="card">
+    <input type="month" id="monthly-date" style="width:100%;padding:10px;border-radius:10px;border:1px solid var(--border);margin-bottom:10px;">
+    <button class="btn secondary" id="monthly-load-btn">Ko'rish</button>
+    <button class="btn" id="monthly-xlsx-btn">📥 Excel yuklab olish</button>
+    <div id="monthly-result" style="overflow-x:auto"></div>
+  </div>
+</div>
+
+<div id="tab-broadcast" style="display:none">
+  <div class="section-title">Xabarnoma yuborish</div>
+  <div class="card">
+    <textarea id="broadcast-text" rows="5" placeholder="Barcha xodimlarga yuboriladigan matn..." style="width:100%;padding:10px;border-radius:10px;border:1px solid var(--border);"></textarea>
+    <button class="btn" id="broadcast-send-btn">📢 Yuborish</button>
+  </div>
+</div>
+
+<div class="modal-backdrop" id="modal-backdrop">
+  <div class="modal" id="modal-content"></div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script src="admin.js"></script>
+</body>
+</html>
