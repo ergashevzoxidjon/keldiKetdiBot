@@ -752,7 +752,7 @@ async def generate_daily_excel_report(date_str: str, file_path: str):
 
 # ================= AUTOMATIC JOBS (SCHEDULER) =================
 def _get_checkin_reminder_targets_sync(today_str: str, now_hm: str):
-    """Har bir xodimning SHAXSIY ish boshlash vaqtiga nisbatan 15, 10 va 0 daqiqa
+    """Har bir xodimning SHAXSIY ish boshlash vaqtiga nisbatan 15, 10 va 5 daqiqa
     qolganda (hali 'Ishga keldim' bosilmagan bo'lsa) eslatma yuborish kerak
     bo'lgan xodimlarni topadi."""
     with get_db() as conn:
@@ -768,7 +768,7 @@ def _get_checkin_reminder_targets_sync(today_str: str, now_hm: str):
                 start_dt = datetime.strptime(start, "%H:%M")
             except ValueError:
                 continue
-            for offset in (15, 10, 0):
+            for offset in (15, 10, 5):
                 target_hm = (start_dt - timedelta(minutes=offset)).strftime("%H:%M")
                 if target_hm == now_hm:
                     cursor.execute(
@@ -783,8 +783,8 @@ def _get_checkin_reminder_targets_sync(today_str: str, now_hm: str):
 
 async def send_checkin_reminders():
     """Har daqiqada ishga tushadi: har bir xodimning SHAXSIY ish boshlash
-    vaqtiga nisbatan 15, 10 va 0 daqiqa qolganda (masalan 9:00 dan ishlasa -
-    8:45, 8:50, 9:00 da) hali kelmagan bo'lsa eslatma yuboradi."""
+    vaqtiga nisbatan 15, 10 va 5 daqiqa qolganda (masalan 9:00 dan ishlasa -
+    8:45, 8:50, 8:55 da) hali kelmagan bo'lsa eslatma yuboradi."""
     now = get_now()
     today_str = now.strftime("%Y-%m-%d")
     now_hm = now.strftime("%H:%M")
@@ -793,10 +793,7 @@ async def send_checkin_reminders():
     for user_id, full_name, offset in targets:
         try:
             kb = get_kb_for(user_id)
-            if offset > 0:
-                body = f"Ish vaqti boshlanishiga <b>{offset} daqiqa</b> qoldi."
-            else:
-                body = "Ish vaqtingiz boshlandi."
+            body = f"Ish vaqti boshlanishiga <b>{offset} daqiqa</b> qoldi."
             await bot.send_message(
                 chat_id=user_id,
                 text=(
@@ -1410,6 +1407,24 @@ async def process_checkout_location(message: types.Message, state: FSMContext):
     )
     await state.clear()
 
+    display_name = await run_db(_get_display_name_sync, user_id, message.from_user.full_name)
+    info = await run_db(_get_checkin_info_sync, user_id, today_str)
+    came = info[0] if info and info[0] else "-"
+    late_min = (info[1] or 0) if info else 0
+    late_line = f"{late_min} daqiqa" if late_min > 0 else "yo'q"
+    checkout_alert = (
+        "🔴 <b>Xodim ishdan ketdi</b>\n\n"
+        f"👤 Xodim: <b>{esc(display_name)}</b>\n"
+        f"⏰ Kelgan vaqti: <b>{esc(came)}</b>\n"
+        f"🚪 Ketgan vaqti: <b>{esc(effective_time_str)}</b>\n"
+        f"⏱ Kechikish: <b>{late_line}</b>"
+    )
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(chat_id=admin_id, text=checkout_alert, parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Admin({admin_id})ga ketish xabarini yuborishda xatolik: {e}")
+
 
 def _checkin_sync(user_id: int, today_str: str, current_time_str: str, lateness: int):
     """Check-in yozuvini kiritadi. UNIQUE indeks tufayli takroriy urinish IntegrityError beradi."""
@@ -1496,9 +1511,10 @@ async def handle_location(message: types.Message, state: FSMContext):
         # handle_lateness_reason ichida). Shu tufayli endi admin xabarni soat
         # nechada ko'rishidan qat'iy nazar, undagi "Kelgan vaqti" doim HAQIQIY
         # kelish vaqtini bildiradi.
+        display_name = await run_db(_get_display_name_sync, user_id, message.from_user.full_name)
         immediate_alert = (
             f"🚨 <b>KECHIKISH!</b>\n\n"
-            f"👤 Xodim: <b>{esc(message.from_user.full_name)}</b>\n"
+            f"👤 Xodim: <b>{esc(display_name)}</b>\n"
             f"⏰ Kelgan vaqti: <b>{esc(current_time_str)}</b>\n"
             f"⏱ Kechikish: <b>{lateness} daqiqa</b>\n"
             f"📝 Sababi: <i>kutilmoqda...</i>"
@@ -1513,6 +1529,21 @@ async def handle_location(message: types.Message, state: FSMContext):
             f"✅ <b>Ishga kelganingiz belgilandi!</b>\n⏰ Vaqt: <b>{current_time_str}</b>",
             reply_markup=kb, parse_mode="HTML"
         )
+
+
+def _get_display_name_sync(user_id: int, fallback: str = "") -> str:
+    """Admin kiritgan ism (users.full_name); topilmasa - Telegram ismi."""
+    with get_db() as conn:
+        row = conn.execute("SELECT full_name FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    return (row[0] if row and row[0] else fallback)
+
+
+def _get_checkin_info_sync(user_id: int, date_str: str):
+    with get_db() as conn:
+        return conn.execute(
+            "SELECT check_in_time, lateness_minutes FROM attendance WHERE user_id = ? AND date = ?",
+            (user_id, date_str)
+        ).fetchone()
 
 
 def _save_lateness_reason_sync(attendance_id: int, reason: str):
@@ -1537,9 +1568,10 @@ async def handle_lateness_reason(message: types.Message, state: FSMContext):
     # handle_location'da) allaqachon yuborilgan - bu yerda faqat sababni
     # qo'shimcha xabar sifatida yuboramiz, shu bilan sabab qancha kech
     # yozilishidan qat'iy nazar, asosiy xabar hech qachon kechikib bormaydi.
+    display_name = await run_db(_get_display_name_sync, user_id, message.from_user.full_name)
     reason_alert = (
-        f"📝 <b>Kechikish sababi keldi</b>\n\n"
-        f"👤 Xodim: <b>{esc(message.from_user.full_name)}</b>\n"
+        f"📝 <b>Kechikish sababi yozildi</b>\n\n"
+        f"👤 Xodim: <b>{esc(display_name)}</b>\n"
         f"⏰ Kelgan vaqti: <b>{esc(data['current_time'])}</b>\n"
         f"⏱ Kechikish: <b>{data['lateness']} daqiqa</b>\n"
         f"📝 Sababi: <i>{esc(reason)}</i>"
@@ -2325,7 +2357,7 @@ async def main():
     await on_startup()
 
     # Ishga kelish/ketish eslatmalari endi har bir xodimning SHAXSIY ish
-    # vaqtiga nisbatan hisoblanadi (masalan 09:00 dan ishlasa - 8:45/8:50/9:00 da,
+    # vaqtiga nisbatan hisoblanadi (masalan 09:00 dan ishlasa - 8:45/8:50/8:55 da,
     # 18:00 da tugasa - 17:45/17:50/17:55 da), shuning uchun har daqiqada tekshiriladi.
     scheduler.add_job(send_checkin_reminders, trigger="cron", day_of_week="mon-sat", minute="*")
     scheduler.add_job(send_checkout_reminders, trigger="cron", day_of_week="mon-sat", minute="*")
