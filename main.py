@@ -568,22 +568,36 @@ def _generate_excel_report_sync(month_prefix: str, file_path: str):
         ws = wb.active
         ws.title = "Oylik Hisobot"
 
+        FIXED_COLS = 8  # yuqoridagi "Xodim F.I.Sh"...:"Sof Beriladigan Oylik" ustunlari soni
+
         headers = [
             "Xodim F.I.Sh", "Belgilangan Oylik", "Norma kun",
             "Jami Ishlangan Soat", "To'lanadigan Soat (2x bilan)",
             "Hisoblangan Maosh", "Berilgan Avans", "Sof Beriladigan Oylik"
         ]
+        # Har bir kun uchun ustun raqamlarini (Kelgan/Ketgan juftligi) va shu
+        # kun yakshanbami-yo'qmi ni saqlab qo'yamiz - keyinroq hujjatda
+        # yakshanba kunlarini alohida rang bilan belgilash uchun kerak bo'ladi.
+        sunday_col_pairs = []  # [(kelgan_col, ketgan_col), ...]
         for day in range(1, days_in_month + 1):
-            headers.append(f"{day}-kun Kelgan")
-            headers.append(f"{day}-kun Ketgan")
+            is_sunday = datetime(year, month, day).weekday() == 6
+            label_suffix = " (Yak)" if is_sunday else ""
+            headers.append(f"{day}-kun Kelgan{label_suffix}")
+            headers.append(f"{day}-kun Ketgan{label_suffix}")
+            if is_sunday:
+                kelgan_col = FIXED_COLS + (day - 1) * 2 + 1
+                sunday_col_pairs.append((kelgan_col, kelgan_col + 1))
         ws.append(headers)
 
         header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
         header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+        sunday_header_fill = PatternFill(start_color="B45309", end_color="B45309", fill_type="solid")
+        sunday_cell_fill = PatternFill(start_color="FFF3CD", end_color="FFF3CD", fill_type="solid")
+        sunday_cols_flat = {c for pair in sunday_col_pairs for c in pair}
 
         for col_num, _ in enumerate(headers, 1):
             cell = ws.cell(row=1, column=col_num)
-            cell.fill = header_fill
+            cell.fill = sunday_header_fill if col_num in sunday_cols_flat else header_fill
             cell.font = header_font
             cell.alignment = Alignment(horizontal="center", vertical="center")
 
@@ -631,6 +645,9 @@ def _generate_excel_report_sync(month_prefix: str, file_path: str):
                 row.append(check_out[:5] if check_out else "-")
 
             ws.append(row)
+            row_idx = ws.max_row
+            for col_num in sunday_cols_flat:
+                ws.cell(row=row_idx, column=col_num).fill = sunday_cell_fill
 
         for col in ws.columns:
             max_len = max(len(str(cell.value or '')) for cell in col)

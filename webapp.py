@@ -651,6 +651,30 @@ ADMIN_PAGE_HTML = """<!doctype html>
     letter-spacing: .04em; margin: 16px 0 8px; border-top: 1px solid rgba(0,0,0,.08); padding-top: 12px;
   }
   .section-title:first-of-type { margin-top: 0; border-top: none; padding-top: 0; }
+  .toggle-row {
+    display: flex; align-items: center; justify-content: space-between; gap: 14px;
+    padding: 11px 0; border-bottom: 1px solid rgba(0,0,0,.06); cursor: pointer;
+  }
+  .toggle-row:last-of-type { border-bottom: none; margin-bottom: 14px; }
+  .toggle-text { min-width: 0; }
+  .toggle-title { font-size: 14px; font-weight: 600; margin-bottom: 3px; }
+  .toggle-desc { font-size: 12px; opacity: .65; line-height: 1.45; }
+  .switch { position: relative; display: inline-block; width: 42px; height: 25px; flex-shrink: 0; }
+  .switch input {
+    position: absolute; inset: 0; width: 100%; height: 100%; margin: 0;
+    opacity: 0; cursor: pointer; z-index: 1;
+  }
+  .switch-track {
+    position: absolute; inset: 0; background: #c8c8cd; border-radius: 999px;
+    transition: background-color .15s ease;
+  }
+  .switch-track::before {
+    content: ""; position: absolute; left: 3px; top: 3px; width: 19px; height: 19px;
+    background: #fff; border-radius: 50%; box-shadow: 0 1px 3px rgba(0,0,0,.35);
+    transition: transform .15s ease;
+  }
+  .switch input:checked + .switch-track { background: var(--tg-theme-button-color, #2481cc); }
+  .switch input:checked + .switch-track::before { transform: translateX(17px); }
 </style>
 </head>
 <body>
@@ -1000,14 +1024,27 @@ function renderDetailCard() {
       <div><label class="meta">Ish tugash</label><input id="workEnd" placeholder="18:00"></div>
     </div>
     <button style="width:100%;margin-bottom:8px" id="saveSchedule">⏰ Ish vaqtini saqlash</button>
-    <div style="margin-bottom:14px">
-      <label style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
-        <input type="checkbox" id="autoCheckoutFlag"> <span class="meta" style="margin:0">Avto-ketish: ish tugagach (yoki "Ketdim" kech bosilsa) tizim ketishni ish tugash vaqtiga avtomatik belgilasin</span>
-      </label>
-      <label style="display:flex;align-items:center;gap:6px">
-        <input type="checkbox" id="overtimeFlag"> <span class="meta" style="margin:0">2x haq: 21:00'dan keyingi va yakshanba kunidagi soatlar 2 barobar hisoblansin</span>
-      </label>
-    </div>
+
+    <label class="toggle-row">
+      <div class="toggle-text">
+        <div class="toggle-title">Avto-ketish</div>
+        <div class="toggle-desc">Ish tugagach (yoki "Ketdim" kech bosilsa) ketish vaqti avtomatik ish tugash vaqtiga belgilanadi.</div>
+      </div>
+      <span class="switch">
+        <input type="checkbox" id="autoCheckoutFlag">
+        <span class="switch-track"></span>
+      </span>
+    </label>
+    <label class="toggle-row">
+      <div class="toggle-text">
+        <div class="toggle-title">2x haq (kech / yakshanba)</div>
+        <div class="toggle-desc">21:00'dan keyingi va yakshanba kunidagi ish soatlari 2 barobar hisoblanadi.</div>
+      </div>
+      <span class="switch">
+        <input type="checkbox" id="overtimeFlag">
+        <span class="switch-track"></span>
+      </span>
+    </label>
 
     <div class="section-title">Davomat</div>
     <div><label class="meta">Sana (o'tgan kunlarni ham tuzatish mumkin)</label><input id="attDate" type="date"></div>
